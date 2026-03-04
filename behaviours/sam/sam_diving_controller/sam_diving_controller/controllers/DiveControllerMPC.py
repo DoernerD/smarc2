@@ -76,7 +76,7 @@ class DiveControllerMPC(DiveControllerInterface):
         # starts conservatively early.  Halving this value doubles the stopping
         # distance that triggers braking entry and doubles the reference curve length.
         # Rule of thumb: start at (observed_decel / 2).
-        self._a_brake_ref = 0.02  # m/s^2  (was 0.08; halved for 0.9 m observed overshoot)
+        self._a_brake_ref = 0.01  # m/s^2  (was 0.08; halved for 0.9 m observed overshoot)
 
         # Extra distance added on top of the kinematic stopping distance when
         # computing the braking entry distance.  Acts as a flat safety buffer that
@@ -178,7 +178,7 @@ class DiveControllerMPC(DiveControllerInterface):
         sam = SAM_casadi(dt=self._dt)
 
         # Flag if you want to rebuild the OCP or not (if changes has been made to the MPC)
-        build = False
+        build = True # TODO: Make this a parameter so you don't need to recompile every tim
 
         # create nmpc object for the OCP
         self.N_horizon = 30  # Prediction horizon
