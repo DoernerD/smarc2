@@ -178,7 +178,7 @@ class DiveControllerMPC(DiveControllerInterface):
         sam = SAM_casadi(dt=self._dt)
 
         # Flag if you want to rebuild the OCP or not (if changes has been made to the MPC)
-        build = True # TODO: Make this a parameter so you don't need to recompile every tim
+        build = False # TODO: Make this a parameter so you don't need to recompile every tim
 
         # create nmpc object for the OCP
         self.N_horizon = 30  # Prediction horizon
@@ -599,7 +599,7 @@ class DiveControllerMPC(DiveControllerInterface):
             # back on the correct side, which with short MPC horizon creates a
             # circular orbit.  When overshot we waive XTE immediately so the vehicle
             # can decelerate and stop close to the goal from any direction.
-            overshot = along > 0.3  # m past the goal along approach direction
+            overshot = False #along > 0.3  # m past the goal along approach direction
 
             # Timeout: if braking has taken too long and position+velocity are fine,
             # waive the XTE check.  Protects against cases where the approach
