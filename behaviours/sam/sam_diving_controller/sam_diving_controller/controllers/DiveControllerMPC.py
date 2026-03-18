@@ -631,7 +631,7 @@ class DiveControllerMPC(DiveControllerInterface):
             depth_close = abs(p_current_3d[2] - self.trajectory[-1, 2]) < 2.0 * self._final_pos_tolerance
             fallback_close = (d_to_final_2d < 1.5 * self._final_pos_tolerance
                               and depth_close)
-            fallback_slow  = total_speed < 3.0 * self._vel_stop_threshold
+            fallback_slow  = total_speed < 1.0 * self._vel_stop_threshold
             fallback_grace = braking_elapsed > self._xte_completion_timeout_s / 2.0
             fallback_ok    = fallback_close and fallback_slow and fallback_grace
 
