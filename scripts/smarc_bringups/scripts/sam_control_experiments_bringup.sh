@@ -72,7 +72,9 @@ tmux send-keys " ros2 launch hydrobatic_localization state_estimator.launch robo
 # controllers that are "constantly running"
 tmux new-window -t $SESSION:3 -n 'control'
 tmux select-window -t $SESSION:3
-tmux send-keys "ros2 launch sam_diving_controller actionserver.launch robot_name:=$ROBOT_NAME" C-m
+# tmux send-keys "ros2 launch sam_diving_controller actionserver.launch robot_name:=$ROBOT_NAME" C-m
+# Mart's RL
+tmux send-keys "ros2 launch sam_diving_controller rl_waypoint_following.launch robot_name:=$ROBOT_NAME" C-m
 
 # SMaRC Publisher
 tmux new-window -t $SESSION:4 -n 'smcp'
