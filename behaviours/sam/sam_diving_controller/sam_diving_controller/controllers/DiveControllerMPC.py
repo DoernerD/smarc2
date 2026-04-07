@@ -916,8 +916,6 @@ class DiveControllerMPC(DiveControllerInterface):
 
         # Thrust vectoring and RPM states come from internal estimators, not topic
         # echoes, so they are always consistent with the model's own integration.
-        # No sign flip here — rpm_hat tracks the model-convention value; the sign
-        # is applied to the published command in set_publishers via _rpm1_sign().
         x[15] = self.a_hat_stern
         x[16] = self.a_hat_rudder
         x[17] = self.rpm_hat_1
