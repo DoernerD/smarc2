@@ -77,7 +77,7 @@ class DiveControllerMPC(DiveControllerInterface):
         build = self.build_ocp
 
         # create nmpc object for the OCP
-        self.N_horizon = 30 #30# 40 #30  # Prediction horizon
+        self.N_horizon = 10 #30 #30# 40 #30  # Prediction horizon
         self.mpc_rate = 0.1
         self.nmpc = NMPC(sam, self.mpc_rate, self.N_horizon, update_solver_settings=build)
         self.nx = self.nmpc.nx  # State vector length + control vector

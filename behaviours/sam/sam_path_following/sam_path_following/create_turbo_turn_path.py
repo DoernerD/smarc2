@@ -254,6 +254,11 @@ def build_waypoints_path(args):
     python3 create_turbo_turn_path.py --mode waypoints \
     --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.3; 4.5,0.02,0.8; 5.5,0.05,1.3; 6.0,0.25,1.5; 5.8,0.45,1.5; 5.5,0.5,1.5; 3.0,0.5,1.5" \
     -o trajectories/return_dive.csv
+
+    static dive test
+    python3 create_turbo_turn_path.py --mode waypoints \
+    --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.0; 3.0,0.0,1.5" \
+    -o trajectories/static_dive.csv
     
     """
     raw = args.wp.replace(" ", "")
