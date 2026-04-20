@@ -225,6 +225,11 @@ def build_waypoints_path(args):
     --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.3; 4.5,0.00,0.8; 5.5,0.00,1.3; 6.0,0.0,1.5" \
     -o trajectories/gentle_straight_dive.csv
 
+    gentle straight dive with return
+    python3 create_turbo_turn_path.py --mode waypoints \
+    --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.3; 4.5,0.00,0.8; 5.5,0.00,1.3; 6.0,0.0,1.5; 3.5, 0, 1.5" \
+    -o trajectories/gentle_straight_dive_with_return.csv
+
     steep straight dive
     python3 create_turbo_turn_path.py --mode waypoints \
     --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.75; 4.0,0.00,1.5; 2.5, 0, 1.5" \
@@ -238,7 +243,12 @@ def build_waypoints_path(args):
     sharper turn dive (full 90 degree turn)
     python3 create_turbo_turn_path.py --mode waypoints \
     --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.3; 5.0,0.0,0.8; 5.5,0.0,1.3; 6.0,0.0,1.5; 6.0,1.0,1.5" \
-    -o trajectories/sharper_turn_dive.csv
+    -o trajectories/sharper_turn_dive.cs    
+    
+    sharper left turn dive (full 90 degree turn)
+    python3 create_turbo_turn_path.py --mode waypoints \
+    --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.3; 5.0,0.0,0.8; 5.5,0.0,1.3; 6.0,0.0,1.5; 6.0,-1.0,1.5" \
+    -o trajectories/sharper_left_turn_dive.csv
 
     sharper turn dive (full 90 degree turn) with small return
     python3 create_turbo_turn_path.py --mode waypoints \
