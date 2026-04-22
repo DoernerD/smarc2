@@ -61,8 +61,13 @@ class DiveSub():
         tf_suffix = self._node.get_parameter('tf_suffix').get_parameter_value().string_value
         self.robot_name = self._node.get_parameter('robot_name').get_parameter_value().string_value
         self._robot_base_link = self.robot_name + '/base_link'+ tf_suffix
-        self._odom_link = self.robot_name + '/odom' # In the sim, this messes things up because we get the odom message not in the odom frame.
-        #self._odom_link = 'unity_origin'
+
+        use_sim_time = self._node.get_parameter('use_sim_time').get_parameter_value().bool_value
+        if use_sim_time:
+            self._odom_link = 'unity_origin'
+        else:
+            self._odom_link = self.robot_name + '/odom'
+
         self.acados_dir = self._node.get_parameter('acados_dir').get_parameter_value().string_value
         self.world_prefix = self._node.get_parameter('world_prefix').get_parameter_value().string_value
 
@@ -105,7 +110,6 @@ class DiveSub():
         self._control_input['stern'] = self.param['tv_u_neutral']
         self._control_input['rudder'] = self.param['tv_u_neutral']
 
-        #self.state_sub = node.create_subscription(msg_type=Odometry, topic='smarc/odom', callback=self._states_cb, qos_profile=10)
         self.state_sub = node.create_subscription(msg_type=Odometry, topic=ControlTopics.STATES, callback=self._states_cb, qos_profile=10)
         self.waypoint_sub = node.create_subscription(msg_type=PoseStamped, topic=ControlTopics.WAYPOINT, callback=self._wp_cb, qos_profile=10)
         self.joy_depth_setpoint_sub = node.create_subscription(msg_type=Float64, topic=ControlTopics.ELEV_SP_TOP, callback=self._joy_depth_setpoint_cb, qos_profile=10)

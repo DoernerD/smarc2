@@ -94,8 +94,8 @@ class PathClient(SMARCActionClient):
                                                               self.uwcomm_start_mission, 1)
                                                               
         # DEBUGGING the trajectory tracking
-        #HERE = FilePath(__file__).parent  # resolves the directory of the script.
-        HERE = FilePath("/home/orin/colcon_ws/src/smarc2/behaviours/sam/sam_path_following/sam_path_following/")
+        HERE = FilePath(__file__).parent  # resolves the directory of the script.
+        #HERE = FilePath("/home/orin/colcon_ws/src/smarc2/behaviours/sam/sam_path_following/sam_path_following/")
         # file_path = HERE / "trajectories" / "2026-01-19__straight_trajectory_1m.csv"
         # file_path = HERE / "trajectories" / "turbo_turn_N11_alpha180_radius2.csv"
         file_path = (
@@ -112,9 +112,9 @@ class PathClient(SMARCActionClient):
             #HERE / "trajectories" / "gentle_straight_dive.csv" # straight dive during the experiments
             #HERE / "trajectories" / "gentle_turn_dive.csv"  # turn towards the corner
             #HERE / "trajectories" / "sharper_turn_dive.csv"  # sharper turn dive (full 90 degree turn)
-            HERE / "trajectories" / "sharper_left_turn_dive.csv"  # sharper turn dive (full 90 degree turn)
+            #HERE / "trajectories" / "sharper_left_turn_dive.csv"  # sharper turn dive (full 90 degree turn)
             #HERE / "trajectories" / "sharper_turn_dive_2.csv"  # sharper turn dive (full 90 degree turn)
-            #HERE / "trajectories" / "gentle_dive_test.csv"  # full turn dive
+            HERE / "trajectories" / "gentle_dive_test.csv"  # full turn dive
             #HERE / "trajectories" / "steep_straight_dive.csv"  # steep straight dive
             #HERE / "trajectories" / "gentle_straight_dive_with_return.csv"  # gentle straight dive with return
 

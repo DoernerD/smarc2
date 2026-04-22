@@ -55,10 +55,12 @@ class DiveControllerMPC(DiveControllerInterface):
         
         # Total speed (norm of u,v,w) below which the last waypoint is
         # declared reached and the action server is allowed to signal COMPLETED.
-        self._vel_stop_threshold = 0.15  # m/s (SAM decelerates through drag only; 0.1 takes too long)
+        # SIM: 0.15 -> 0.12 
+        self._vel_stop_threshold = 0.12  # m/s
 
         # Position tolerance for completion detection at the final waypoint.
-        self._final_pos_tolerance = 1.0  # m (relaxed: real vehicle can't stop on a dime)
+        # SIM: 1.0 -> 0.5.  
+        self._final_pos_tolerance = 0.5  # m
 
         # Debounce counter for COMPLETED detection.  All stopping conditions must be
         # satisfied for this many consecutive control steps before the action is
@@ -75,6 +77,25 @@ class DiveControllerMPC(DiveControllerInterface):
             "build_ocp"
         ).get_parameter_value().bool_value
         build = self.build_ocp
+
+        # SIM: workaround for a known Unity-sim bug where the reported LCG
+        # feedback is inverted (publishes 100 when LCG = 0 and vice versa).
+        # Tied to the standard ROS2 ``use_sim_time`` parameter — that
+        # parameter is automatically declared by rclpy on every Node and is
+        # conventionally set to True in simulation launch files (so the
+        # clock is read from /clock) and False on the real vehicle.  This
+        # way the inversion is active exactly when we're running against
+        # the sim, without introducing a separate flag.  Remove this block
+        # and the ``_correct_lcg_feedback`` helper once the sim-side fix
+        # lands.
+        self._invert_lcg_feedback = self._node.get_parameter(
+            "use_sim_time"
+        ).get_parameter_value().bool_value
+        if self._invert_lcg_feedback:
+            self._loginfo(
+                "LCG feedback inversion ENABLED (use_sim_time=True) — "
+                "compensating for Unity sim bug that swaps LCG 0<->100."
+            )
 
         # create nmpc object for the OCP
         self.N_horizon = 30 #30# 40 #30  # Prediction horizon
@@ -101,7 +122,7 @@ class DiveControllerMPC(DiveControllerInterface):
         self.arc_lengths = None      # cumulative arc-length at each waypoint
         self.path_t_hat = np.zeros((self.N_horizon, 3))    # tangent per stage
         self.path_theta_hat = np.zeros(self.N_horizon)     # linearization point per stage
-        self._v_target = 0.2         # progress speed target for yref (m/s)
+        self._v_target = 0.4         # SIM: progress speed target for yref (m/s); matches surge_max=0.4 so solver pulls v_theta to the bound without headroom (reduces end-of-trajectory overshoot)
         self._v_theta_prev = 0.0     # v_theta from previous solve (for manual propagation)
         self._depth_locked = False   # armed once z crosses depth_lock_threshold
         self._wall_locked = False    # armed once x crosses wall_lock_threshold
@@ -271,11 +292,29 @@ class DiveControllerMPC(DiveControllerInterface):
                     self.ocp_solver.constraints_set(k, "lbx", lbx)
 
         # ---- Build MPCC parameter vector and yref per stage ----
-        # v_theta target ramps to zero over the last decel_dist metres of
-        # arc length so the solver plans a smooth deceleration over many
-        # stages instead of seeing "go fast" everywhere and "stop" only at
-        # the terminal.
-        decel_dist = 2.5  # [m] arc-length before end to start ramping v_theta down
+        # v_theta target ramps from _v_target down to v_floor over the last
+        # decel_dist metres of arc length so the solver plans a smooth
+        # deceleration over many stages instead of seeing "go fast"
+        # everywhere and "stop" only at the terminal.
+        # SIM: 2.5 -> 1.0 -> 0.3 -> 0.8 -> 1.5.  Earlier values of a_brake
+        # (0.007) made the brake funnel the dominant decelerator over the
+        # last ~2 m, so a short decel_dist=0.3 was the right call to avoid
+        # double-deceleration.  With a_brake=0.1 the funnel now only
+        # engages in the last ~0.3 m, so decel_dist IS the main soft
+        # decelerator for v_theta.  0.8 m was enough time to wind v_theta
+        # down smoothly, but the vehicle still carried enough kinetic
+        # energy into the last 0.3 m to overshoot the goal; 1.5 m gives
+        # the stage cost ~3.8 s to pull surge down from 0.4 to 0.1 m/s
+        # (decel ~0.08 m/s²), which is below a_brake=0.1, so the funnel
+        # stays quiet and just acts as a safety net.
+        # SIM: v_floor added so the stage target doesn't ramp to 0 while
+        # the terminal cost pulls to 0.1 — that disagreement was producing
+        # a small equilibrium around ~0.05 m/s at the goal, effectively
+        # cancelling the "small forward push" that yref_e[4]=0.1 was
+        # providing.  With v_floor matching yref_e[4], stage and terminal
+        # targets agree and the vehicle coasts in at 0.1 m/s consistently.
+        decel_dist = 1.5  # [m] arc-length before end to start ramping v_theta down
+        v_floor    = 0.1  # [m/s] minimum v_theta target — matches yref_e[4]
         for stage in range(self.N_horizon):
             ref_row = self.ref[stage, :] if stage < self.ref.shape[0] else self.ref[-1, :]
             p = np.r_[ref_row, self._goal_pos,
@@ -285,10 +324,18 @@ class DiveControllerMPC(DiveControllerInterface):
             yref_k = np.zeros(self.nmpc.n_stage_cost)
             if self.ref_is_traj and self.theta_total > 0:
                 remaining_k = max(self.theta_total - self.path_theta_hat[stage], 0.0)
-                if remaining_k < decel_dist:
-                    yref_k[4] = self._v_target * (remaining_k / decel_dist)
-                else:
-                    yref_k[4] = self._v_target
+                # SIM: re-enabled (was previously `yref_k[4] = self._v_target`
+                # with the ramp commented out).  Disabling the ramp meant
+                # there was ZERO stage-cost deceleration across the
+                # horizon — the solver saw "target = 0.4" at every stage and
+                # only "target = 0.1" at the single terminal stage.  That
+                # single-stage pull cannot dominate a full horizon of
+                # stage-cost "go fast", which is the direct cause of the
+                # late/weak braking and end-of-trajectory overshoot.
+                yref_k[4] = max(
+                    v_floor,
+                    self._v_target * (remaining_k / decel_dist),
+                )
             else:
                 yref_k[4] = self._v_target
             self.ocp_solver.cost_set(stage, "yref", yref_k)
@@ -297,7 +344,19 @@ class DiveControllerMPC(DiveControllerInterface):
         p_terminal = np.r_[terminal_ref, self._goal_pos,
                            self.path_t_hat[-1], self.path_theta_hat[-1]]
         self.ocp_solver.set(self.N_horizon, "p", p_terminal)
+        # SIM: yref_e[4] = v_theta target at terminal.  Zero was the original
+        # "stop exactly at terminal" target, but combined with Q_sync=120 it
+        # made the solver plan to reach x[7]=0 at horizon end, and in MPC
+        # that back-propagates to "command RPM≈0 now" when within ~3 s of
+        # the goal.  The vehicle then drifts slowly on drag alone and
+        # sometimes stalls before the completion-tolerance debounce
+        # triggers.  Setting the terminal target to 0.1 m/s (below the
+        # _vel_stop_threshold of 0.15) means the solver plans a gentle
+        # coast-in instead of a hard brake — the small forward bias the
+        # vehicle needs — while still being counted as "stopped" by the
+        # completion logic.
         yref_e = np.zeros(self.nmpc.n_terminal_cost)
+        yref_e[4] = 0.1  # v_theta target
         self.ocp_solver.cost_set(self.N_horizon, "yref", yref_e)
 
         # Set current state
@@ -406,13 +465,20 @@ class DiveControllerMPC(DiveControllerInterface):
             theta_proj = self._project_onto_path(
                 p_now, theta_hint=self.theta, window=search_window
             )
-            self.theta = np.clip(theta_proj, 0.0, self.theta_total)
+            # SIM: forward-only ratchet restored.  Without it, projection noise
+            # can briefly pull self.theta backward, which then feeds into the
+            # path lookahead and corrupts the reference linearization point.
+            theta_old = self.theta
+            self.theta = np.clip(max(theta_proj, theta_old), 0.0, self.theta_total)
 
-            #self.v_theta = max(
-            #    float(mpc_solution[self.nmpc.N_PHYS_STATES + 1]),
-            #    0.1,
-            #)
-            self.v_theta = float(mpc_solution[self.nmpc.N_PHYS_STATES + 1])
+            # SIM: minimum v_theta floor restored so the MPCC progress variable
+            # can't collapse to 0 (which makes the reference geometry freeze and
+            # leaves the solver with no gradient toward motion — the exact stall
+            # mode we were seeing).
+            self.v_theta = max(
+                float(mpc_solution[self.nmpc.N_PHYS_STATES + 1]),
+                0.1,
+            )
 
         end_theta_time = time.time()
         theta_solver = float(self.ocp_solver.get(1, "x")[self.nmpc.N_PHYS_STATES])
@@ -724,19 +790,6 @@ class DiveControllerMPC(DiveControllerInterface):
             self.trajectory = np.concatenate(
                 (self.trajectory, theta_col, Uref), axis=1
             )
-            # self.trajectory now has shape (traj_len, 20 + 7) = (traj_len, 27)
-
-            # Snap first waypoint to the vehicle's current position so the
-            # spline starts where the AUV actually is.  Avoids initial lateral
-            # correction from DR drift that can overshoot at high RPM.
-            #if self._current_state is not None:
-            #    self.trajectory[0, 0] = self._current_state.pose.pose.position.x
-            #    self.trajectory[0, 1] = self._current_state.pose.pose.position.y
-            #    self.trajectory[0, 2] = self._current_state.pose.pose.position.z
-            #    self._loginfo(
-            #        f"Snapped WP0 to vehicle position: "
-            #        f"({self.trajectory[0, 0]:.3f}, {self.trajectory[0, 1]:.3f}, {self.trajectory[0, 2]:.3f})"
-            #    )
 
             self._goal_pos = self.trajectory[-1, :3].copy()
             self._completion_debounce_count = 0
@@ -878,6 +931,21 @@ class DiveControllerMPC(DiveControllerInterface):
 
         return odom_wp
 
+    def _correct_lcg_feedback(self, raw_lcg):
+        """
+        SIM workaround: Unity sim publishes an inverted LCG value (0 <-> 100).
+        When ``use_sim_time`` is True, flip the raw reading so the solver's
+        x[14] matches the physical LCG position (0 = all the way aft,
+        100 = all the way forward, per the SAM_casadi model convention).
+        No-op on the real vehicle (use_sim_time=False).
+
+        Remove this helper and the flag read in __init__ once the sim-side
+        LCG inversion is fixed.
+        """
+        if self._invert_lcg_feedback:
+            return 100.0 - float(raw_lcg)
+        return float(raw_lcg)
+
     def get_state_array(self, state_msg, control_msg, is_init_state=False, is_trajectory=False):
         """
         Build the augmented state vector x (20 elements):
@@ -903,7 +971,7 @@ class DiveControllerMPC(DiveControllerInterface):
         x[11] = state_msg.twist.twist.angular.y
         x[12] = state_msg.twist.twist.angular.z
         x[13] = control_msg["vbs"]
-        x[14] = control_msg["lcg"]
+        x[14] = self._correct_lcg_feedback(control_msg["lcg"])
 
         # Thrust vectoring and RPM states come from internal estimators, not topic
         # echoes, so they are always consistent with the model's own integration.
@@ -1012,7 +1080,8 @@ class DiveControllerMPC(DiveControllerInterface):
         self.ocp_solver.set(0, "lbx", x0)
         self.ocp_solver.set(0, "ubx", x0)
         self.get_current_ref_array()
-        decel_dist = 2.5
+        decel_dist = 1.5  # SIM: keep in sync with the value in update()
+        v_floor    = 0.1  # SIM: keep in sync with yref_e[4] / v_floor in update()
         for stage in range(self.N_horizon):
             ref_row = self.ref[stage, :] if stage < self.ref.shape[0] else self.ref[-1, :]
             p = np.r_[ref_row, self._goal_pos,
@@ -1021,7 +1090,11 @@ class DiveControllerMPC(DiveControllerInterface):
             yref_k = np.zeros(self.nmpc.n_stage_cost)
             if self.ref_is_traj and self.theta_total > 0:
                 remaining_k = max(self.theta_total - self.path_theta_hat[stage], 0.0)
-                yref_k[4] = self._v_target * min(remaining_k / decel_dist, 1.0)
+                # SIM: re-enabled — see rationale in update()
+                yref_k[4] = max(
+                    v_floor,
+                    self._v_target * (remaining_k / decel_dist),
+                )
             else:
                 yref_k[4] = self._v_target
             self.ocp_solver.cost_set(stage, "yref", yref_k)
@@ -1030,6 +1103,7 @@ class DiveControllerMPC(DiveControllerInterface):
                            self.path_t_hat[-1], self.path_theta_hat[-1]]
         self.ocp_solver.set(self.N_horizon, "p", p_terminal)
         yref_e = np.zeros(self.nmpc.n_terminal_cost)
+        yref_e[4] = 0.1  # SIM: terminal v_theta target — see comment in update()
         self.ocp_solver.cost_set(self.N_horizon, "yref", yref_e)
 
         n_warmup = 5
@@ -1082,7 +1156,8 @@ class DiveControllerMPC(DiveControllerInterface):
             # actually advance theta.  On curved paths (dives) an over-
             # aggressive lookahead evaluates t_hat at unreachable arc-lengths,
             # corrupting the SQP gradient and causing QP failures.
-            v_theta_max = 0.2
+            # SIM: must match surge_max in control.py (currently 0.5).
+            v_theta_max = 0.5
             v_near = min(max(self.v_theta, 0.1), v_theta_max)
             v_far  = min(max(self.v_theta * 1.2, 0.15), v_theta_max)
 
@@ -1105,7 +1180,26 @@ class DiveControllerMPC(DiveControllerInterface):
             # Guard: only apply the offset when the ahead-tangent roughly
             # agrees with the local tangent (cos > 0); fall back to the
             # local tangent at sharp reversals.
-            heading_offset = 2.0  # [m] pitch-trim lookahead
+            # SIM: 2.0 -> 1.0 m.  At sim cruise speed 0.4 m/s the original
+            # 2.0 m offset was 5 s ahead — BEYOND the 3 s prediction
+            # horizon (N=30 * dt=0.1).  That meant the t_hat passed into
+            # the OCP (which is also used to decompose pos_diff into
+            # contour + lag in control.py:599-602) was anchored to a path
+            # point the solver couldn't reach inside its planning window.
+            # On turning sections this caused two problems:
+            #   1. Pitch reference came from 2 m ahead — vehicle prematurely
+            #      committed to dive geometry the local path didn't yet
+            #      require ("decided to sink first").
+            #   2. Contour error decomposed against the lookahead tangent
+            #      had a bias whose perpendicular pointed in a partially
+            #      wrong direction relative to the LOCAL path tangent —
+            #      causing the rudder to deflect against the upcoming turn
+            #      direction at startup ("steers in the other direction").
+            # 1.0 m sits at end-of-horizon (0.4 m/s * 3 s = 1.2 m), keeping
+            # anticipation but eliminating the past-horizon anchoring.  The
+            # real vehicle didn't see this because it cruised faster — 2 m
+            # was within its effective horizon time.
+            heading_offset = 1.0  # [m] pitch-trim lookahead
             self.ref = np.zeros((self.N_horizon, self.nx + self.nu))
             for stage in range(self.N_horizon):
                 p_ref, t_local, _ = self._get_path_geometry(self.path_theta_hat[stage])
