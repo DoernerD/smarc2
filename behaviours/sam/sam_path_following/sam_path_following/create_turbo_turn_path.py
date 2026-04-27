@@ -259,7 +259,43 @@ def build_waypoints_path(args):
     python3 create_turbo_turn_path.py --mode waypoints \
     --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.3; 4.5,0.02,0.8; 5.5,0.05,1.3; 6.0,0.25,1.5; 5.8,0.45,1.5; 5.5,0.5,1.5; 3.0,0.5,1.5" \
     -o trajectories/return_dive.csv
+
+    gentle dive + 180° pivot with WIDE y=1.0 return leg
+    (relaxed counterpart of gentle_dive_test.csv: halves the pivot
+    curvature so the MPC no longer needs opposite-sign thrust to
+    complete the turn, while still demonstrating the tight-radius
+    agility story.  effective pivot radius ~0.5 m vs ~0.25 m in
+    the y=0.5 version.)
+    python3 create_turbo_turn_path.py --mode waypoints \
+    --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.3; 4.5,0.0,0.8; 5.5,0.0,1.3; 6.0,0.0,1.5; 6.0,1.0,1.5; 5.5,1.0,1.5; 3.0,1.0,1.5; 2.5,1.0,1.5; 2.25,1.0,1.5; 2.0,1.0,1.5" \
+    -o trajectories/gentle_dive_test_wide.csv
+
+    gentle dive + 180° pivot with WIDE y=1.0 return leg
+    (relaxed counterpart of gentle_dive_test.csv: halves the pivot
+    curvature so the MPC no longer needs opposite-sign thrust to
+    complete the turn, while still demonstrating the tight-radius
+    agility story.  effective pivot radius ~0.5 m vs ~0.25 m in
+    the y=0.5 version.)
+    python3 create_turbo_turn_path.py --mode waypoints \
+    --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.3; 4.5,0.0,0.8; 5.5,0.0,1.3; 6.0,0.0,1.5; 6.5,0.0,1.5; 7.0,1.0,1.5; 6.0,1.5,1.5; 5.5,1.3,1.5; 3.0,1.0,1.5; 2.5,1.0,1.5; 2.25,1.0,1.5; 2.0,1.0,1.5" \
+    --y-interp pchip \
+    -o trajectories/gentle_dive_test_wide_2_pchip_y.csv
     
+    Gentle dive with turn and immediate stop
+    python3 create_turbo_turn_path.py --mode waypoints \
+    --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.3; \
+        4.5,0.0,0.8; 5.5,0.0,1.3; 6.0,0.0,1.5; \
+            6.5,0.0,1.5; 7.0,1.0,1.5; 6.0,1.7,1.5; 5.0,1.55,1.5; 4.5,1.5,1.5" \
+    --y-interp pchip \
+    -o trajectories/gentle_dive_test_wide_2_pchip_y_very_short_tail.csv
+
+    Gentle dive with 360
+    python3 create_turbo_turn_path.py --mode waypoints \
+    --wp "1.0,0.0,0.0; 2.0,0.0,0.0; 3.0,0.0,0.3; \
+        4.5,0.0,0.8; 5.5,0.0,1.3; 6.0,0.0,1.5; \
+            6.5,0.0,1.5; 7.0,1.0,1.5; 6.0,1.7,1.5; 5.0,1.55,1.5; 4.5,1.0,1.5; 5.0,0.0,1.5; 5.5,0.0,1.5" \
+    --y-interp pchip \
+    -o trajectories/gentle_dive_test_wide_2_pchip_y_360_turn.csv
     """
     raw = args.wp.replace(" ", "")
     tokens = [t for t in raw.split(";") if t]
@@ -383,14 +419,25 @@ def _spline_dense_samples(spl_x, spl_y, spl_z, theta_total, n_waypoints, n_min=2
 
 
 def plot_path(x, y, z, yaw, u_per_wp, dr_per_wp, args, out_path):
-    """Plot waypoints and arc-length cubic spline in a vertical stack:
-    XY, XZ, X/Y/Z vs arc length, pitch (if depth varies), and curvature."""
+    """Plot waypoints and arc-length spline in a vertical stack:
+    XY, XZ, X/Y/Z vs arc length, pitch (if depth varies), and curvature.
+
+    Per-axis interpolator type is chosen via ``args.x_interp`` /
+    ``args.y_interp`` / ``args.z_interp`` (``"cubic"`` or ``"pchip"``),
+    mirroring the MPCC controller's ``mpcc_{x,y,z}_interpolator`` ROS
+    params so the offline plot matches what the controller will see.
+    """
     N = len(x)
     has_depth = np.ptp(z) > 1e-3
 
     spline_ok = False
     if N >= 2:
-        arc_lengths, theta_total, spl_x, spl_y, spl_z = compute_spline(x, y, z)
+        arc_lengths, theta_total, spl_x, spl_y, spl_z = compute_spline(
+            x, y, z,
+            x_kind=args.x_interp,
+            y_kind=args.y_interp,
+            z_kind=args.z_interp,
+        )
         if theta_total > 1e-9 and np.all(np.diff(arc_lengths) > 1e-15):
             try:
                 s_fine, xs, ys, zs = _spline_dense_samples(
@@ -580,7 +627,8 @@ def plot_path(x, y, z, yaw, u_per_wp, dr_per_wp, args, out_path):
         ax_curv.legend(loc="best")
 
     fig.suptitle(
-        f"Turbo turn path — {args.mode}  (Green=FWD, Red=BWD)",
+        f"Turbo turn path — {args.mode}  (Green=FWD, Red=BWD)  "
+        f"[interp x={args.x_interp}, y={args.y_interp}, z={args.z_interp}]",
         fontsize=14,
     )
     plt.tight_layout()
@@ -589,13 +637,39 @@ def plot_path(x, y, z, yaw, u_per_wp, dr_per_wp, args, out_path):
     print(f"Saved plot: {out_path}")
     plt.show()
 
-def compute_spline(x, y, z):
-    """Compute cumulative arc-lengths and fit cubic splines through the waypoints.
+def _build_axis_interpolator(s, values, bc, kind, axis_label):
+    """Build the 1-D spline for a single axis (x / y / z).
 
-    After this call:
-      self.arc_lengths  — cumulative arc-length at each waypoint
-      self.theta_total  — total path length
-      self._spl_x/y/z   — CubicSpline: arc_length -> position (C2 smooth)
+    Mirrors ``DiveControllerMPC._build_axis_interpolator``: ``kind`` is
+    the per-axis selector string (``"cubic"`` / ``"pchip"``).  Both
+    interpolators support first-derivative queries (``spline(s, 1)``),
+    so downstream code doesn't need to know which was chosen.  Unknown
+    values fall back to cubic with a warning.
+    """
+    kind = (kind or "cubic").lower()
+    if kind == "pchip":
+        return PchipInterpolator(s, values)
+    if kind != "cubic":
+        print(
+            f"[compute_spline] Unknown {axis_label}-interpolator='{kind}', "
+            f"falling back to cubic"
+        )
+    return CubicSpline(s, values, bc_type=bc)
+
+
+def compute_spline(x, y, z, x_kind="cubic", y_kind="cubic", z_kind="cubic"):
+    """Compute cumulative arc-lengths and fit splines through the waypoints.
+
+    Per-axis interpolator type (``"cubic"`` — default, C2 smooth not-a-knot
+    CubicSpline; or ``"pchip"`` — C1, monotone-preserving PchipInterpolator
+    that suppresses the spurious oscillation CubicSpline produces through
+    sequences of near-collinear waypoints ended by a sharp direction change)
+    matches the MPCC controller's ``mpcc_{x,y,z}_interpolator`` ROS params.
+
+    Returns:
+      arc_lengths  — cumulative arc-length at each waypoint
+      theta_total  — total path length
+      spl_x/y/z    — 1-D interpolator: arc_length -> position
     """
     arc_lengths = np.zeros(len(x))
     for i in range(1, len(x)):
@@ -608,9 +682,9 @@ def compute_spline(x, y, z):
     # (unlike "clamped" which forces zero derivative).
     # Falls back to "natural" for 2-point paths where "not-a-knot" needs >= 3.
     bc = "not-a-knot" if len(x) >= 3 else "natural"
-    spl_x = CubicSpline(s, x, bc_type=bc)
-    spl_y = CubicSpline(s, y, bc_type=bc) #PchipInterpolator(s, y)
-    spl_z = CubicSpline(s, z, bc_type=bc)
+    spl_x = _build_axis_interpolator(s, x, bc, x_kind, "x")
+    spl_y = _build_axis_interpolator(s, y, bc, y_kind, "y")
+    spl_z = _build_axis_interpolator(s, z, bc, z_kind, "z")
     return arc_lengths, theta_total, spl_x, spl_y, spl_z
 
 def add_intermediate_waypoints(x, y, z, yaw, u_per_wp, dr_per_wp, n_intermediate):
@@ -780,7 +854,41 @@ def parse_args():
         default=2,
         help="Number of level-off waypoints to add at the end (default: 2)",
     )
-    return parser.parse_args()
+    # Per-axis spline interpolator selection (mirrors the MPCC controller's
+    # ``mpcc_{x,y,z}_interpolator`` ROS params).  Use ``pchip`` on an axis
+    # whose waypoints are near-collinear followed by a sharp direction
+    # change (the not-a-knot cubic oscillates there).
+    interp_choices = ["cubic", "pchip"]
+    parser.add_argument(
+        "--x-interp",
+        choices=interp_choices,
+        default="cubic",
+        help="Spline interpolator for the X axis (default: cubic)",
+    )
+    parser.add_argument(
+        "--y-interp",
+        choices=interp_choices,
+        default="cubic",
+        help="Spline interpolator for the Y axis (default: cubic)",
+    )
+    parser.add_argument(
+        "--z-interp",
+        choices=interp_choices,
+        default="cubic",
+        help="Spline interpolator for the Z axis (default: cubic)",
+    )
+    parser.add_argument(
+        "--interp",
+        choices=interp_choices,
+        default=None,
+        help="Shortcut to set --x-interp / --y-interp / --z-interp at once",
+    )
+    args = parser.parse_args()
+    if args.interp is not None:
+        args.x_interp = args.interp
+        args.y_interp = args.interp
+        args.z_interp = args.interp
+    return args
 
 
 def main():

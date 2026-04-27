@@ -1,5 +1,8 @@
 #!/usr/bin/python3
 
+import atexit
+import csv
+import os
 import time
 
 import numpy as np
@@ -59,8 +62,24 @@ class DiveControllerMPC(DiveControllerInterface):
         self._vel_stop_threshold = 0.12  # m/s
 
         # Position tolerance for completion detection at the final waypoint.
-        # SIM: 1.0 -> 0.5.  
-        self._final_pos_tolerance = 0.5  # m
+        # SIM: 1.0 -> 0.5 -> 0.75 -> 1.0.  Widened 0.75 -> 1.0 because the
+        # rudder-and-surge controller is nonholonomic — once the vehicle
+        # has traced the full path and decelerated to a stop, it cannot
+        # translate LATERALLY to close a residual XY offset without
+        # either lateral thrust (which the vehicle doesn't have) or
+        # executing another full pivot-and-approach cycle (which gains
+        # only a few tens of cm and is not the mission's intent).  User
+        # reported the vehicle stopping "a smidge outside the completion
+        # radius" but being structurally unable to close the remaining
+        # gap, causing the mission to time out even though the
+        # trajectory was effectively complete.  1.0 m is loose enough to
+        # absorb this nonholonomic residual while still being tight
+        # enough relative to a ~12 m path (8 % of path length).  The
+        # tighter r_track=0.5 m in control.py takes care of keeping the
+        # vehicle close during the tracking phase, so the wider
+        # completion tolerance only relaxes the FINAL-waypoint check,
+        # not the path-tracking behaviour.
+        self._final_pos_tolerance = 1.0  # m
 
         # Debounce counter for COMPLETED detection.  All stopping conditions must be
         # satisfied for this many consecutive control steps before the action is
@@ -98,7 +117,25 @@ class DiveControllerMPC(DiveControllerInterface):
             )
 
         # create nmpc object for the OCP
-        self.N_horizon = 30 #30# 40 #30  # Prediction horizon
+        # SIM: N_horizon 30 -> 45 (Tf 3.0 s -> 4.5 s at dt=0.1).  The 30-stage
+        # horizon was too short to see the payoff of a 180° rotation at the
+        # hairpin: rotating from yaw=0° back to yaw=180° takes ~6 s at the
+        # weak rudder authority available during the brake-forward transition
+        # (low |u| → low lift → ~0.5 rad/s max yaw rate), so at Tf=3 s the
+        # solver never saw the "after rotation, forward surge is free" basin
+        # and preferred the locally-stable "stay at yaw≈0°, just reverse
+        # through the hairpin" solution (trace row 547: theta=7.33, u=-0.27,
+        # yaw_err=-178°, RPMs saturated at -500 for 100+ ticks; 36.7 % of
+        # all run ticks in reverse).  At N=45 the solver can see 4.5 s ahead,
+        # enough to cover brake (1 s) + ~60° of rotation — should drag the
+        # optimum toward the forward-rotated plan even if the full 180° payoff
+        # is still outside the window.  Compute cost ~1.5×; update() latency
+        # should still fit the 100 ms control loop budget.  If 45 isn't
+        # enough, the next step is 60 (Tf=6 s), which covers the full
+        # rotation end-to-end.  If compute becomes a bottleneck at 45/60,
+        # consider dropping dt to 0.15 with N=40 (Tf=6 s, same stages as
+        # current N=30×dt=0.2 but better discretization).
+        self.N_horizon = 45
         self.mpc_rate = 0.1
         self.nmpc = NMPC(sam, self.mpc_rate, self.N_horizon, update_solver_settings=build)
         self.nx = self.nmpc.nx  # State vector length + control vector
@@ -120,17 +157,27 @@ class DiveControllerMPC(DiveControllerInterface):
         self.delta_v_theta = 0.0     #   solver sees theta advancing from the first solve)
         self.theta_total = 0.0       # total arc-length of the loaded trajectory
         self.arc_lengths = None      # cumulative arc-length at each waypoint
-        self.path_t_hat = np.zeros((self.N_horizon, 3))    # tangent per stage
+        self.path_t_hat = np.zeros((self.N_horizon, 3))    # lookahead tangent per stage (used by cost)
+        self.path_t_local = np.zeros((self.N_horizon, 3))  # local tangent at theta_hat per stage (used by track constraint)
         self.path_theta_hat = np.zeros(self.N_horizon)     # linearization point per stage
-        self._v_target = 0.4         # SIM: progress speed target for yref (m/s); matches surge_max=0.4 so solver pulls v_theta to the bound without headroom (reduces end-of-trajectory overshoot)
+        # Terminal-stage local tangent (tracked separately so the terminal
+        # parameter vector can carry it without indexing past path_t_local).
+        self._terminal_t_local = np.zeros(3)
+        self._v_target = 0.3         # SIM: progress speed target for yref (m/s); matches surge_max=0.3 so solver pulls v_theta to the bound without headroom (reduces end-of-trajectory overshoot).  Lowered 0.4 -> 0.3 to tame post-pivot recovery on the 180°-return trajectory: at v=0.4 the vehicle carried enough lateral momentum through the pivot exit that by the time the rudder brought the nose onto the tangent, the body had already overshot, producing the "oversteer, can't rejoin the line" oscillation.  KE scales with v² so the 25% drop in v is ~44% less ballistic energy into the recovery phase.  The pivot itself is surge-near-zero so it is unaffected by this change.  surge_max in control.py was lowered in lockstep to preserve the "no headroom above cruise target" property that keeps end-of-trajectory braking clean.  NOTE: tried 0.3 -> 0.2 to attack post-pivot sway momentum, but the AUV could not complete the U-turn at v=0.2 — rudder force scales with v² so dropping 0.3 -> 0.2 cuts yaw moment to ~(0.2/0.3)² = 44% of the v=0.3 case, which is below the threshold needed to drive the 180° pivot to completion.  Reverted.  Post-pivot sway addressed instead by truncating the post-pivot straight section in the trajectory (gentle_dive_test_wide_2_pchip_y_short_tail) so the trajectory completes while the vehicle is still in the recovery transient, before the perpendicular-drift attractor establishes.
         self._v_theta_prev = 0.0     # v_theta from previous solve (for manual propagation)
         self._depth_locked = False   # armed once z crosses depth_lock_threshold
         self._wall_locked = False    # armed once x crosses wall_lock_threshold
 
-        # Cubic spline representation of the path (built in _compute_arc_lengths)
-        self._spl_x = None           # CubicSpline: arc_length -> x
-        self._spl_y = None           # PchipInterpolator: arc_length -> y (monotone-preserving)
-        self._spl_z = None           # CubicSpline: arc_length -> z
+        # Per-axis path interpolators (built in _compute_arc_lengths).  Each
+        # is CubicSpline or PchipInterpolator per the mpcc_*_interpolator ROS
+        # params.  Both types expose spline(s) and spline(s, 1) with the same
+        # call signature so _get_path_geometry is interpolator-agnostic.
+        # Current launch defaults: x=cubic, y=pchip, z=cubic -- see the
+        # launch file for the reasoning (y=pchip avoids C2 ringing through
+        # stretches of equal-y waypoints followed by a sharp y-change).
+        self._spl_x = None           # arc_length -> x
+        self._spl_y = None           # arc_length -> y
+        self._spl_z = None           # arc_length -> z
         
         # Spline evaluation
         self.spl_eval_x = None
@@ -184,7 +231,50 @@ class DiveControllerMPC(DiveControllerInterface):
         self._print_ref_state_debug = self._node.get_parameter(
             "debug_print_ref_state"
         ).get_parameter_value().bool_value
+        # Every-N ticks between rosout dumps when debug_print_ref_state=True.
+        # Set to 1 for every-tick trace (useful for basin-of-attraction
+        # analysis on hard trajectories).
+        self._node.declare_parameter("debug_print_ref_state_throttle", 10)
+        self._print_ref_state_period = max(1, int(self._node.get_parameter(
+            "debug_print_ref_state_throttle"
+        ).get_parameter_value().integer_value))
         self._print_ref_state_throttle = 0
+
+        # Per-axis path interpolator.  Default "cubic" preserves the
+        # existing behaviour.  Set to "pchip" to use PchipInterpolator
+        # (C1, monotone-preserving) on that axis — useful on trajectories
+        # with near-collinear waypoints followed by a sharp direction
+        # change, where the not-a-knot cubic spline oscillates and makes
+        # the MPCC linearization tangent nondeterministic around the
+        # turn.  ``gentle_dive_test`` is exactly that pattern on y.
+        self._node.declare_parameter("mpcc_x_interpolator", "cubic")
+        self._node.declare_parameter("mpcc_y_interpolator", "cubic")
+        self._node.declare_parameter("mpcc_z_interpolator", "cubic")
+        self._mpcc_x_interp = self._node.get_parameter(
+            "mpcc_x_interpolator"
+        ).get_parameter_value().string_value.lower()
+        self._mpcc_y_interp = self._node.get_parameter(
+            "mpcc_y_interpolator"
+        ).get_parameter_value().string_value.lower()
+        self._mpcc_z_interp = self._node.get_parameter(
+            "mpcc_z_interpolator"
+        ).get_parameter_value().string_value.lower()
+
+        # ---- Per-tick CSV trace ---------------------------------------------
+        # When ``debug_trace_csv_path`` is non-empty, open a CSV at that
+        # path and write one row per control tick with the full MPCC
+        # diagnostic state.  Intended to replace rosout parsing for
+        # basin-of-attraction A/B experiments.  File is flushed after
+        # every row and closed on process exit.
+        self._node.declare_parameter("debug_trace_csv_path", "")
+        self._debug_trace_csv_path = self._node.get_parameter(
+            "debug_trace_csv_path"
+        ).get_parameter_value().string_value
+        self._trace_file = None
+        self._trace_writer = None
+        self._trace_t0 = None
+        if self._debug_trace_csv_path:
+            self._open_trace_csv(self._debug_trace_csv_path)
 
 
     def update(self):
@@ -248,8 +338,6 @@ class DiveControllerMPC(DiveControllerInterface):
         self.get_current_ref_array()
         end_ref_time = time.time()
         np.set_printoptions(precision=3)
-        self._loginfo(f"x_current: {x_current[:3]}")
-
         # ---- NaN guard ----
         if np.any(np.isnan(x_current)):
             nan_idx = np.where(np.isnan(x_current))[0]
@@ -318,7 +406,8 @@ class DiveControllerMPC(DiveControllerInterface):
         for stage in range(self.N_horizon):
             ref_row = self.ref[stage, :] if stage < self.ref.shape[0] else self.ref[-1, :]
             p = np.r_[ref_row, self._goal_pos,
-                       self.path_t_hat[stage], self.path_theta_hat[stage]]
+                       self.path_t_hat[stage], self.path_theta_hat[stage],
+                       self.path_t_local[stage]]
             self.ocp_solver.set(stage, "p", p)
 
             yref_k = np.zeros(self.nmpc.n_stage_cost)
@@ -342,7 +431,8 @@ class DiveControllerMPC(DiveControllerInterface):
 
         terminal_ref = getattr(self, '_terminal_ref', self.ref[-1, :])
         p_terminal = np.r_[terminal_ref, self._goal_pos,
-                           self.path_t_hat[-1], self.path_theta_hat[-1]]
+                           self.path_t_hat[-1], self.path_theta_hat[-1],
+                           self._terminal_t_local]
         self.ocp_solver.set(self.N_horizon, "p", p_terminal)
         # SIM: yref_e[4] = v_theta target at terminal.  Zero was the original
         # "stop exactly at terminal" target, but combined with Q_sync=120 it
@@ -408,7 +498,8 @@ class DiveControllerMPC(DiveControllerInterface):
                 for stg in range(self.N_horizon):
                     ref_row = self.ref[stg, :] if stg < self.ref.shape[0] else self.ref[-1, :]
                     p = np.r_[ref_row, self._goal_pos,
-                               self.path_t_hat[stg], self.path_theta_hat[stg]]
+                               self.path_t_hat[stg], self.path_theta_hat[stg],
+                               self.path_t_local[stg]]
                     self.ocp_solver.set(stg, "p", p)
                 self.ocp_solver.set(self.N_horizon, "p", p_terminal)
                 for attempt in range(5):
@@ -438,9 +529,23 @@ class DiveControllerMPC(DiveControllerInterface):
             # Optional: log reference vs state and actual rudder/stern command (after solve)
             if self._print_ref_state_debug:
                 self._print_ref_state_throttle += 1
-                if self._print_ref_state_throttle >= 10:
+                if self._print_ref_state_throttle >= self._print_ref_state_period:
                     self._print_ref_state_throttle = 0
-                    self.print_reference_vs_state_debug(x_current, mpc_solution=mpc_solution)
+                    self.print_reference_vs_state_debug(
+                        x_current,
+                        mpc_solution=mpc_solution,
+                        solver_status=status,
+                    )
+
+        # Always emit the CSV trace row when enabled — the file is the
+        # primary diagnostic surface; rosout is just for live spot-checks.
+        if self._trace_writer is not None:
+            self._write_trace_row(
+                x_current=x_current,
+                mpc_solution=mpc_solution,
+                solver_status=status,
+                solve_time=end_time - start_time,
+            )
 
         # Actuator state estimators: integrate commanded rates to track actuator
         # states. All rates are in model convention; sign is applied in
@@ -461,7 +566,14 @@ class DiveControllerMPC(DiveControllerInterface):
         start_theta_time = time.time()
         if mpc_solution is not None and status == 0 and self.ref_is_traj and self.theta_total > 0:
             p_now = x_current[:3]
-            search_window = max(2.0, self.v_theta * self._dt * 20)
+            # Window is now symmetric around theta_hint in _project_onto_path,
+            # so the effective per-tick bound is +/- search_window/2.  Max
+            # vehicle motion per tick is v_max * dt ~= 0.04 m; a +/- 0.15 m
+            # floor gives ~3x slack for catch-up while preventing the
+            # branch-crossing that produced phantom 1 m jumps on tight
+            # pivots.  The v_theta-dependent term still lets the window grow
+            # naturally on long dt or high-speed motion.
+            search_window = max(0.3, self.v_theta * self._dt * 10)
             theta_proj = self._project_onto_path(
                 p_now, theta_hint=self.theta, window=search_window
             )
@@ -556,14 +668,38 @@ class DiveControllerMPC(DiveControllerInterface):
 
     # ---- MPCC path geometry helpers ------------------------------------------
 
+    def _build_axis_interpolator(self, s, values, bc, kind, axis_label):
+        """Build the 1-D spline for a single axis (x / y / z).
+
+        ``kind`` is the ROS-param string (``"cubic"`` / ``"pchip"``).
+        Both types support first-derivative queries (spline(s, 1)) and
+        return scalars, so _get_path_geometry doesn't need to know which
+        was chosen.  Unknown values fall back to cubic with a warning.
+        """
+        if kind == "pchip":
+            return PchipInterpolator(s, values)
+        if kind != "cubic":
+            self._logwarn(
+                f"Unknown mpcc_{axis_label}_interpolator='{kind}', "
+                f"falling back to cubic"
+            )
+        return CubicSpline(s, values, bc_type=bc)
+
     def _compute_arc_lengths(self):
-        """Compute cumulative arc-lengths and fit cubic splines through the waypoints.
+        """Compute cumulative arc-lengths and fit splines through the waypoints.
 
         After this call:
-          self.arc_lengths  — cumulative arc-length at each waypoint
-          self.theta_total  — total path length
-          self._spl_x/z     — CubicSpline: arc_length -> position (C2 smooth)
-          self._spl_y       — PchipInterpolator: arc_length -> y (C1, monotone-preserving) to prevent switching y derivative.
+          self.arc_lengths    — cumulative arc-length at each waypoint
+          self.theta_total    — total path length
+          self._spl_x/y/z     — 1-D interpolator: arc_length -> position
+
+        The per-axis interpolator type is controlled by the ROS params
+        ``mpcc_x_interpolator`` / ``mpcc_y_interpolator`` / ``mpcc_z_interpolator``
+        (``"cubic"`` — default, C2 smooth not-a-knot CubicSpline; or
+        ``"pchip"`` — C1, monotone-preserving PchipInterpolator, which
+        suppresses the spurious oscillation CubicSpline produces through
+        sequences of near-collinear waypoints ended by a sharp direction
+        change).
         """
         self.arc_lengths = np.zeros(self.traj_len)
         for i in range(1, self.traj_len):
@@ -577,12 +713,13 @@ class DiveControllerMPC(DiveControllerInterface):
         # (unlike "clamped" which forces zero derivative).
         # Falls back to "natural" for 2-point paths where "not-a-knot" needs >= 3.
         bc = "not-a-knot" if self.traj_len >= 3 else "natural"
-        self._spl_x = CubicSpline(s, self.trajectory[:, 0], bc_type=bc)
-        self._spl_y = CubicSpline(s, self.trajectory[:, 1], bc_type=bc) #PchipInterpolator(s, self.trajectory[:, 1])
-        self._spl_z = CubicSpline(s, self.trajectory[:, 2], bc_type=bc)
+        self._spl_x = self._build_axis_interpolator(s, self.trajectory[:, 0], bc, self._mpcc_x_interp, "x")
+        self._spl_y = self._build_axis_interpolator(s, self.trajectory[:, 1], bc, self._mpcc_y_interp, "y")
+        self._spl_z = self._build_axis_interpolator(s, self.trajectory[:, 2], bc, self._mpcc_z_interp, "z")
         self._loginfo(
             f"MPCC spline built: {self.traj_len} waypoints, "
-            f"theta_total={self.theta_total:.3f} m"
+            f"theta_total={self.theta_total:.3f} m "
+            f"(interp: x={self._mpcc_x_interp}, y={self._mpcc_y_interp}, z={self._mpcc_z_interp})"
         )
         # Pre-evaluate the spline for faster runtime access
         self.spl_eval_x = self._spl_x(np.linspace(0.0, self.theta_total, self.n_eval))
@@ -624,8 +761,19 @@ class DiveControllerMPC(DiveControllerInterface):
         pos = np.asarray(pos, dtype=float)
 
         if theta_hint is not None and window is not None:
-            lo = max(theta_hint, 0.0)
-            hi = min(theta_hint + window, self.theta_total)
+            # Symmetric window around theta_hint.  Previously
+            # [theta_hint, theta_hint + window] (forward-only), which
+            # meant the outer max(theta_proj, theta_old) ratchet was a
+            # no-op and the only projection guard was the window
+            # itself.  At 2 m wide that was enough to let
+            # minimize_scalar cross to a different spline branch on
+            # tight pivots, returning a theta up to ~1 m past the one
+            # the vehicle is actually following.  Symmetric keeps the
+            # search local to the current branch; the outer ratchet
+            # still filters sub-cm numerical wobble.
+            half = 0.5 * window
+            lo = max(theta_hint - half, 0.0)
+            hi = min(theta_hint + half, self.theta_total)
         else:
             lo, hi = 0.0, self.theta_total
 
@@ -724,8 +872,275 @@ class DiveControllerMPC(DiveControllerInterface):
         }
         return result
 
-    def print_reference_vs_state_debug(self, x_current, mpc_solution=None):
-        """Log MPCC reference vs state for debugging."""
+    # ---- CSV trace -----------------------------------------------------------
+    # The CSV mirrors the print_reference_vs_state_debug payload but writes
+    # one row per control tick (instead of throttled rosout).  Use it to
+    # diff failing vs successful runs in pandas/matplotlib without parsing
+    # screen scroll-back.
+    _TRACE_HEADER = [
+        "t", "wall_time",
+        "status",
+        "x", "y", "z",
+        "qw", "qx", "qy", "qz", "yaw_deg",
+        "u", "v", "w", "p_ang", "q_ang", "r_ang",
+        "vbs", "lcg",
+        "stern", "rudder", "rpm1", "rpm2",
+        "theta", "v_theta",
+        "ref_x", "ref_y", "ref_z", "ref_yaw_deg",
+        "t_hat_x", "t_hat_y", "t_hat_z", "cos_align",
+        "e_c", "e_l", "e_sync", "yaw_err_deg",
+        "cmd_stern", "cmd_rudder", "cmd_rpm1", "cmd_rpm2",
+        "solve_time_s",
+        "depth_locked", "wall_locked",
+        "traj_idx", "traj_len",
+        # ---- Track-constraint diagnostics (added during phantom-violation
+        # investigation: with the local-tangent constraint, an on-path
+        # vehicle at non-zero (theta - theta_hat) on a curve registers a
+        # spurious cross-track error of O(curvature * (theta-theta_hat)^2).
+        # These columns let us compare what the constraint sees against
+        # the actual nearest-spline distance, and find which horizon
+        # stage is the worst offender.) ----
+        "e_c_local",                   # ||e_c|| using LOCAL tangent at p_ref[0] (= what the constraint sees, stage 0)
+        "path_dist_actual",            # min ||x[:3] - spline(s)|| via dense sweep (true cross-track)
+        "track_h_max", "track_h_stage",  # max h_track value across predicted horizon and which stage
+        "track_su_max", "track_su_stage",  # max upper-slack on track constraint across horizon and which stage
+        "theta_pred_minus_hat_max",    # max |solver_theta[k] - path_theta_hat[k]| across horizon (curvature-offset proxy)
+        "t_local_x", "t_local_y", "t_local_z",
+    ]
+
+    def _open_trace_csv(self, path):
+        """Open the CSV trace file, write the header, register cleanup.
+        
+        Failures here are non-fatal: we log and disable tracing rather
+        than aborting the whole node, so a bad path doesn't break the
+        controller.
+        """
+        try:
+            abspath = os.path.abspath(os.path.expanduser(path))
+            os.makedirs(os.path.dirname(abspath) or ".", exist_ok=True)
+            self._trace_file = open(abspath, "w", newline="", buffering=1)
+            self._trace_writer = csv.writer(self._trace_file)
+            self._trace_writer.writerow(self._TRACE_HEADER)
+            self._trace_t0 = time.time()
+            atexit.register(self._close_trace_csv)
+            self._loginfo(f"MPCC trace CSV opened: {abspath}")
+        except Exception as exc:
+            self._logwarn(f"Failed to open MPCC trace CSV at {path!r}: {exc}")
+            self._trace_file = None
+            self._trace_writer = None
+
+    def _close_trace_csv(self):
+        try:
+            if self._trace_file is not None and not self._trace_file.closed:
+                self._trace_file.close()
+        except Exception:
+            pass
+
+    def _write_trace_row(self, x_current, mpc_solution, solver_status, solve_time):
+        """Write a single row to the trace CSV.  Silent on failure."""
+        try:
+            r = self.ref[0, :] if (self.ref is not None and self.ref.shape[0] > 0) else None
+            t_hat0 = self.path_t_hat[0] if self.path_t_hat is not None else (0.0, 0.0, 0.0)
+            # Trace cos_align mirrors the cost: t_hat (lookahead tangent) is
+            # what attitude/sync residuals use.  t_local0 is still
+            # materialised below for the track-constraint diagnostics.
+            t_local0 = (
+                self.path_t_local[0]
+                if getattr(self, "path_t_local", None) is not None
+                   and len(self.path_t_local) > 0
+                else t_hat0
+            )
+
+            yaw_cur = self._yaw_from_state_quat(x_current[3:7])
+            yaw_ref = self._yaw_from_state_quat(r[3:7]) if r is not None else float("nan")
+            yaw_err = np.arctan2(np.sin(yaw_cur - yaw_ref), np.cos(yaw_cur - yaw_ref)) \
+                if r is not None else float("nan")
+
+            q = x_current[3:7]
+            fwd_x = 1.0 - 2.0 * (q[2] ** 2 + q[3] ** 2)
+            fwd_y = 2.0 * (q[1] * q[2] + q[0] * q[3])
+            fwd_z = 2.0 * (q[1] * q[3] - q[0] * q[2])
+            cos_align = float(fwd_x * t_hat0[0] + fwd_y * t_hat0[1] + fwd_z * t_hat0[2])
+
+            if r is not None:
+                err = self.compute_x_error_numpy(
+                    x_current, r, terminal=False,
+                    t_hat=t_hat0, theta_hat=self.path_theta_hat[0],
+                )
+                e_c = float(np.linalg.norm(err["e_c_vec"]))
+                e_l = float(err["e_l"])
+            else:
+                e_c = float("nan")
+                e_l = float("nan")
+
+            if mpc_solution is not None:
+                v_theta_solver = float(mpc_solution[self.nmpc.N_PHYS_STATES + 1])
+                cmd_stern, cmd_rudder = self._map_actuator_commands(mpc_solution)
+                cmd_rpm1 = float(mpc_solution[17])
+                cmd_rpm2 = float(mpc_solution[18])
+            else:
+                v_theta_solver = float("nan")
+                cmd_stern = cmd_rudder = cmd_rpm1 = cmd_rpm2 = float("nan")
+
+            v_along = float(x_current[7]) * cos_align
+            e_sync = v_theta_solver - v_along
+
+            # ---- Track-constraint diagnostics ----
+            # t_local0 already assigned above (shared with cos_align).
+
+            # e_c_local at stage 0: what the constraint actually sees here.
+            if r is not None:
+                p_ref0 = np.asarray(r[:3], dtype=float)
+                t_loc0 = np.asarray(t_local0, dtype=float)
+                pos_diff0 = x_current[:3] - p_ref0
+                e_l_loc0 = float(np.dot(pos_diff0, t_loc0))
+                e_c_local_vec0 = pos_diff0 - e_l_loc0 * t_loc0
+                e_c_local0 = float(np.linalg.norm(e_c_local_vec0))
+            else:
+                e_c_local0 = float("nan")
+
+            # Actual nearest-spline distance: dense-sweep the pre-evaluated
+            # spline arrays.  Fast (numpy ufuncs over n_eval points) and
+            # exact to the sample resolution — way better than the linear
+            # tangent approximation when curvature matters.
+            try:
+                if (
+                    getattr(self, "spl_eval_x", None) is not None
+                    and self.spl_eval_x.size > 0
+                ):
+                    dx = self.spl_eval_x - x_current[0]
+                    dy = self.spl_eval_y - x_current[1]
+                    dz = self.spl_eval_z - x_current[2]
+                    d2 = dx * dx + dy * dy + dz * dz
+                    path_dist_actual = float(np.sqrt(d2.min()))
+                else:
+                    path_dist_actual = float("nan")
+            except Exception:
+                path_dist_actual = float("nan")
+
+            # Per-stage h_track and slack across the predicted horizon.
+            # h_track is recomputed in numpy from the solver's predicted
+            # state at each stage and the LOCAL tangent we sent into the
+            # parameter vector.  su[7] is the upper-slack on the track
+            # constraint (idxsbx has 4 entries; idxsh entry 3 is the
+            # 4th h-constraint, so slack index = 4 + 3 = 7).
+            track_h_max = float("nan")
+            track_h_stage = -1
+            track_su_max = float("nan")
+            track_su_stage = -1
+            theta_pred_minus_hat_max = float("nan")
+            try:
+                h_max = -np.inf
+                h_arg = -1
+                su_max = -np.inf
+                su_arg = -1
+                dt_max = 0.0
+                for k in range(self.N_horizon + 1):
+                    xk = self.ocp_solver.get(k, "x")
+                    p_ref_k = (
+                        self.ref[k, :3] if k < self.ref.shape[0] else self.ref[-1, :3]
+                    )
+                    t_loc_k = (
+                        self.path_t_local[k] if k < self.N_horizon else self._terminal_t_local
+                    )
+                    diff_k = xk[:3] - np.asarray(p_ref_k, dtype=float)
+                    e_l_k = float(np.dot(diff_k, t_loc_k))
+                    e_c_k = diff_k - e_l_k * t_loc_k
+                    h_k = float(np.dot(e_c_k, e_c_k))
+                    if h_k > h_max:
+                        h_max = h_k
+                        h_arg = k
+
+                    theta_hat_k = (
+                        self.path_theta_hat[k]
+                        if k < self.N_horizon
+                        else self.path_theta_hat[-1]
+                    )
+                    dt_k = abs(float(xk[self.nmpc.N_PHYS_STATES]) - float(theta_hat_k))
+                    if dt_k > dt_max:
+                        dt_max = dt_k
+
+                    # acados slack vectors per stage: layout [sbx | sh].
+                    # idxsbx = [0,1,2,3] (4 entries) → sh entries start at index 4.
+                    # idxsh entry 3 is the track constraint → su index = 4 + 3 = 7.
+                    try:
+                        su_k = self.ocp_solver.get(k, "su")
+                        if su_k is not None and len(su_k) > 7:
+                            sk = float(su_k[7])
+                            if sk > su_max:
+                                su_max = sk
+                                su_arg = k
+                    except Exception:
+                        pass
+
+                if h_max > -np.inf:
+                    track_h_max = h_max
+                    track_h_stage = h_arg
+                if su_max > -np.inf:
+                    track_su_max = su_max
+                    track_su_stage = su_arg
+                theta_pred_minus_hat_max = dt_max
+            except Exception:
+                pass
+
+            now = time.time()
+            t_rel = now - self._trace_t0 if self._trace_t0 is not None else 0.0
+            status_str = self._acados_status.get(solver_status, f"UNKNOWN({solver_status})") \
+                if solver_status is not None else "n/a"
+
+            self._trace_writer.writerow([
+                f"{t_rel:.4f}", f"{now:.4f}",
+                status_str,
+                f"{x_current[0]:.4f}", f"{x_current[1]:.4f}", f"{x_current[2]:.4f}",
+                f"{q[0]:.6f}", f"{q[1]:.6f}", f"{q[2]:.6f}", f"{q[3]:.6f}",
+                f"{np.rad2deg(yaw_cur):.3f}",
+                f"{x_current[7]:.4f}", f"{x_current[8]:.4f}", f"{x_current[9]:.4f}",
+                f"{x_current[10]:.4f}", f"{x_current[11]:.4f}", f"{x_current[12]:.4f}",
+                f"{x_current[13]:.3f}", f"{x_current[14]:.3f}",
+                f"{x_current[15]:.4f}", f"{x_current[16]:.4f}",
+                f"{x_current[17]:.1f}", f"{x_current[18]:.1f}",
+                f"{self.theta:.4f}", f"{self.v_theta:.4f}",
+                f"{r[0]:.4f}" if r is not None else "nan",
+                f"{r[1]:.4f}" if r is not None else "nan",
+                f"{r[2]:.4f}" if r is not None else "nan",
+                f"{np.rad2deg(yaw_ref):.3f}" if r is not None else "nan",
+                f"{t_hat0[0]:+.4f}", f"{t_hat0[1]:+.4f}", f"{t_hat0[2]:+.4f}",
+                f"{cos_align:+.4f}",
+                f"{e_c:.4f}", f"{e_l:+.4f}", f"{e_sync:+.4f}",
+                f"{np.rad2deg(yaw_err):+.3f}" if r is not None else "nan",
+                f"{cmd_stern:+.4f}", f"{cmd_rudder:+.4f}",
+                f"{cmd_rpm1:+.1f}", f"{cmd_rpm2:+.1f}",
+                f"{solve_time:.5f}",
+                int(getattr(self, "_depth_locked", False)),
+                int(getattr(self, "_wall_locked", False)),
+                int(getattr(self, "traj_index", -1)),
+                int(getattr(self, "traj_len", -1)),
+                f"{e_c_local0:.4f}",
+                f"{path_dist_actual:.4f}",
+                f"{track_h_max:.6f}", int(track_h_stage),
+                f"{track_su_max:.6f}", int(track_su_stage),
+                f"{theta_pred_minus_hat_max:.4f}",
+                f"{t_local0[0]:+.4f}", f"{t_local0[1]:+.4f}", f"{t_local0[2]:+.4f}",
+            ])
+        except Exception as exc:
+            # Don't take the controller down for a logging glitch — and
+            # don't spam either: disable tracing on first failure.
+            self._logwarn(f"trace CSV write failed, disabling trace: {exc}")
+            self._close_trace_csv()
+            self._trace_writer = None
+
+    def print_reference_vs_state_debug(self, x_current, mpc_solution=None, solver_status=None):
+        """Log MPCC reference vs state for debugging.
+
+        Prints enough state to diagnose which SQP basin the solver is in
+        on hard trajectories (tight k-turns, sharp reversals): heading
+        error, along-tangent alignment (cos_align), e_sync, surge, RPM,
+        solver status, and — crucially — the path tangent that the cost
+        was linearised against (``t_hat[0]``).  If two failing runs
+        diverge because the solver commits to different directions at a
+        pivot, that shows up as different ``t_hat`` / ``cos_align`` /
+        ``e_sync`` values at the first few ticks across the pivot.
+        """
         if self.ref is None or self.ref.shape[0] == 0:
             self._loginfo("REF_STATE_DBG: no reference set")
             return
@@ -737,23 +1152,47 @@ class DiveControllerMPC(DiveControllerInterface):
             np.sin(yaw_cur - yaw_ref), np.cos(yaw_cur - yaw_ref)
         )
 
+        t_hat0 = self.path_t_hat[0]
         err = self.compute_x_error_numpy(
             x_current, r, terminal=False,
-            t_hat=self.path_t_hat[0], theta_hat=self.path_theta_hat[0],
+            t_hat=t_hat0, theta_hat=self.path_theta_hat[0],
         )
+
+        q = x_current[3:7]
+        fwd_x = 1.0 - 2.0 * (q[2] ** 2 + q[3] ** 2)
+        fwd_y = 2.0 * (q[1] * q[2] + q[0] * q[3])
+        fwd_z = 2.0 * (q[1] * q[3] - q[0] * q[2])
+        cos_align = float(fwd_x * t_hat0[0] + fwd_y * t_hat0[1] + fwd_z * t_hat0[2])
+        v_theta_solver = (
+            float(mpc_solution[self.nmpc.N_PHYS_STATES + 1])
+            if mpc_solution is not None else float("nan")
+        )
+        v_along = float(x_current[7]) * cos_align
+        e_sync = v_theta_solver - v_along
+
+        status_str = (
+            self._acados_status.get(solver_status, f"UNKNOWN({solver_status})")
+            if solver_status is not None else "n/a"
+        )
+
         lines = [
             "========== MPCC DEBUG ==========",
             f"  theta: {self.theta:.3f}/{self.theta_total:.3f}  traj_idx: {self.traj_index}/{self.traj_len}",
             f"  REF  pos=({r[0]:.3f}, {r[1]:.3f}, {r[2]:.3f})  yaw={np.rad2deg(yaw_ref):.1f} deg",
             f"  STATE pos=({x_current[0]:.3f}, {x_current[1]:.3f}, {x_current[2]:.3f})  yaw={np.rad2deg(yaw_cur):.1f} deg",
-            f"  vel u,v,w=({x_current[7]:.3f}, {x_current[8]:.3f}, {x_current[9]:.3f})",
-            f"  stern={x_current[15]:.3f}  rudder={x_current[16]:.3f}",
-            f"  MPCC  e_c={np.linalg.norm(err['e_c_vec']):.4f}  e_l={err['e_l']:.4f}  yaw_err={np.rad2deg(yaw_err):.1f} deg",
+            f"  vel   u,v,w=({x_current[7]:.3f}, {x_current[8]:.3f}, {x_current[9]:.3f})",
+            f"  act   stern={x_current[15]:.3f}  rudder={x_current[16]:.3f}  "
+            f"rpm=({x_current[17]:.0f}, {x_current[18]:.0f})",
+            f"  t_hat=({t_hat0[0]:+.3f}, {t_hat0[1]:+.3f}, {t_hat0[2]:+.3f})  "
+            f"cos_align={cos_align:+.3f}",
+            f"  MPCC  e_c={np.linalg.norm(err['e_c_vec']):.4f}  e_l={err['e_l']:+.4f}  "
+            f"e_sync={e_sync:+.4f}  yaw_err={np.rad2deg(yaw_err):+.1f} deg",
         ]
         if mpc_solution is not None:
             cmd_stern, cmd_rudder = self._map_actuator_commands(mpc_solution)
             lines.append(
-                f"  cmd stern={cmd_stern:.4f}  rudder={cmd_rudder:.4f}"
+                f"  cmd   stern={cmd_stern:+.4f}  rudder={cmd_rudder:+.4f}  "
+                f"rpm=({mpc_solution[17]:+.0f}, {mpc_solution[18]:+.0f})"
             )
         self._loginfo("\n".join(lines))
 
@@ -1085,7 +1524,8 @@ class DiveControllerMPC(DiveControllerInterface):
         for stage in range(self.N_horizon):
             ref_row = self.ref[stage, :] if stage < self.ref.shape[0] else self.ref[-1, :]
             p = np.r_[ref_row, self._goal_pos,
-                       self.path_t_hat[stage], self.path_theta_hat[stage]]
+                       self.path_t_hat[stage], self.path_theta_hat[stage],
+                       self.path_t_local[stage]]
             self.ocp_solver.set(stage, "p", p)
             yref_k = np.zeros(self.nmpc.n_stage_cost)
             if self.ref_is_traj and self.theta_total > 0:
@@ -1100,7 +1540,8 @@ class DiveControllerMPC(DiveControllerInterface):
             self.ocp_solver.cost_set(stage, "yref", yref_k)
         terminal_ref = self.ref[-1, :]
         p_terminal = np.r_[terminal_ref, self._goal_pos,
-                           self.path_t_hat[-1], self.path_theta_hat[-1]]
+                           self.path_t_hat[-1], self.path_theta_hat[-1],
+                           self._terminal_t_local]
         self.ocp_solver.set(self.N_horizon, "p", p_terminal)
         yref_e = np.zeros(self.nmpc.n_terminal_cost)
         yref_e[4] = 0.1  # SIM: terminal v_theta target — see comment in update()
@@ -1148,18 +1589,43 @@ class DiveControllerMPC(DiveControllerInterface):
             # to advance at whatever rate the OCP finds optimal.
             theta_i = self.theta
             N_half = self.N_horizon // 2
-            # Original values:
-            # v_near = max(self.v_theta, 0.4)
-            # v_far  = max(self.v_theta * 1.5, 0.8)
-            # Cap lookahead speeds at the OCP's hard v_theta_max bound so the
-            # linearization points never race ahead of where the solver can
-            # actually advance theta.  On curved paths (dives) an over-
-            # aggressive lookahead evaluates t_hat at unreachable arc-lengths,
-            # corrupting the SQP gradient and causing QP failures.
-            # SIM: must match surge_max in control.py (currently 0.5).
-            v_theta_max = 0.5
-            v_near = min(max(self.v_theta, 0.1), v_theta_max)
-            v_far  = min(max(self.v_theta * 1.2, 0.15), v_theta_max)
+            # SIM: must match surge_max in control.py (currently 0.4).
+            v_theta_max = 0.4
+
+            # SIM: lookahead rate is DECOUPLED from self.v_theta.  The old
+            # `max(self.v_theta, 0.1)` floor was meant to stop runaway
+            # lookahead, but it has a perverse failure mode on tight
+            # maneuvers (tight k-turns, sharp reversals):
+            #
+            #   * On an overshoot the solver wants v_theta = 0 and
+            #     self.v_theta pins at the 0.1 refloor.
+            #   * v_near then drops to 0.1, so the horizon covers only
+            #     0.1 m/s · 30 · 0.1 s = 0.3 m of arc length.
+            #   * The k-turn segment in gentle_dive_test is ~0.5-1.0 m
+            #     of arc length, so *every* stage of the horizon
+            #     anchors path_theta_hat inside the pivot region.
+            #   * Meanwhile yref_k[4] still pulls v_theta toward
+            #     _v_target = 0.4 — a direct contradiction with a
+            #     horizon that has no "exit" geometry to advance into.
+            #   * The SQP resolves this by oscillating u (which is what
+            #     the CSV shows) while theta and v_theta stay pinned.
+            #
+            # Using _v_target as the lookahead rate keeps horizon
+            # coverage at ~1.2 m regardless of transient solver state,
+            # so the OCP always sees past the pivot.  The theta_total
+            # clamp below still prevents overshoot at the path end, so
+            # there's no "unreachable arc length" regression either —
+            # we're only changing where the linearization points go
+            # during transient self.v_theta collapses, not in steady
+            # state (where self.v_theta ≈ _v_target anyway).
+            v_lookahead = min(self._v_target, v_theta_max)
+            v_near = v_lookahead
+            v_far  = v_lookahead
+            
+            # Old:
+            #v_theta_max = 0.5
+            #v_near = min(max(self.v_theta, 0.1), v_theta_max)
+            #v_far  = min(max(self.v_theta * 1.2, 0.15), v_theta_max)
 
             # No lookahead ramp-down: the theta_total clamp below already
             # prevents theta_hat from overshooting the path end.  Without the
@@ -1180,26 +1646,48 @@ class DiveControllerMPC(DiveControllerInterface):
             # Guard: only apply the offset when the ahead-tangent roughly
             # agrees with the local tangent (cos > 0); fall back to the
             # local tangent at sharp reversals.
-            # SIM: 2.0 -> 1.0 m.  At sim cruise speed 0.4 m/s the original
-            # 2.0 m offset was 5 s ahead — BEYOND the 3 s prediction
-            # horizon (N=30 * dt=0.1).  That meant the t_hat passed into
-            # the OCP (which is also used to decompose pos_diff into
-            # contour + lag in control.py:599-602) was anchored to a path
-            # point the solver couldn't reach inside its planning window.
-            # On turning sections this caused two problems:
-            #   1. Pitch reference came from 2 m ahead — vehicle prematurely
-            #      committed to dive geometry the local path didn't yet
-            #      require ("decided to sink first").
+            # SIM: 2.0 -> 1.0 -> 0.3 m.  At sim cruise speed 0.4 m/s the
+            # original 2.0 m offset was 5 s ahead — BEYOND the 3 s
+            # prediction horizon (N=30 * dt=0.1).  That meant the t_hat
+            # passed into the OCP (which is also used to decompose
+            # pos_diff into contour + lag in control.py:599-602) was
+            # anchored to a path point the solver couldn't reach inside
+            # its planning window.  On turning sections this caused two
+            # problems:
+            #   1. Pitch reference came from 2 m ahead — vehicle
+            #      prematurely committed to dive geometry the local path
+            #      didn't yet require ("decided to sink first").
             #   2. Contour error decomposed against the lookahead tangent
             #      had a bias whose perpendicular pointed in a partially
             #      wrong direction relative to the LOCAL path tangent —
-            #      causing the rudder to deflect against the upcoming turn
-            #      direction at startup ("steers in the other direction").
-            # 1.0 m sits at end-of-horizon (0.4 m/s * 3 s = 1.2 m), keeping
-            # anticipation but eliminating the past-horizon anchoring.  The
-            # real vehicle didn't see this because it cruised faster — 2 m
-            # was within its effective horizon time.
-            heading_offset = 1.0  # [m] pitch-trim lookahead
+            #      causing the rudder to deflect against the upcoming
+            #      turn direction at startup ("steers in the other
+            #      direction").
+            # 1.0 m sat at end-of-horizon (0.4 m/s * 3 s = 1.2 m),
+            # keeping anticipation but eliminating the past-horizon
+            # anchoring.
+            # 1.0 -> 0.3 m (further reduction).  On the gentle_dive_test_
+            # wide_2 trajectory at theta ≈ 5.88 (0.4 m before the hairpin
+            # pivot at s=6.28), stage 0's t_hat at offset=1.0 sampled the
+            # y-spline derivative at s=6.88 — inside the +Y pivot leg
+            # where the pchip-y derivative peaks at ~1.36.  That made
+            # t_hat_y ≈ 1.0 on the dive, so yaw_ref swung to +90° while
+            # the vehicle was still on the straight dive, and the solver
+            # started a CW rotation 0.6 m early.  With offset=0.3, stage
+            # 0 at theta=5.88 samples at s=6.18 — still inside the dive
+            # (y=0 exactly under pchip) — and rotation is not asked for
+            # until the vehicle is ~0.3 m from the pivot.  Late horizon
+            # stages still pick up anticipation via path_theta_hat
+            # propagation (stage 29 at v=0.4 m/s, dt=0.1, N=30 sees
+            # theta + 1.2 m + 0.3 m = 1.5 m ahead), so rotation is
+            # distributed across ~1.2 m of arc length — enough to
+            # stay below rudder saturation at v_target=0.3 m/s.
+            # If a future trajectory needs more anticipation for a
+            # well-separated turn, raise back toward 0.6–0.8 m; the
+            # only constraint is that (theta + offset) for stage 0
+            # should NOT sample past the start of the next tight curve
+            # on the final approach to that curve.
+            heading_offset = 0.3  # [m] pitch-trim lookahead
             self.ref = np.zeros((self.N_horizon, self.nx + self.nu))
             for stage in range(self.N_horizon):
                 p_ref, t_local, _ = self._get_path_geometry(self.path_theta_hat[stage])
@@ -1212,6 +1700,7 @@ class DiveControllerMPC(DiveControllerInterface):
 
                 self.ref[stage, :3] = p_ref
                 self.path_t_hat[stage] = t_hat
+                self.path_t_local[stage] = t_local
                 
 
                 # This is never used. The actual computational cost is based on t_hat and p_ref alone
@@ -1239,6 +1728,7 @@ class DiveControllerMPC(DiveControllerInterface):
             theta_term_ahead = min(theta_terminal + heading_offset, self.theta_total)
             _, t_term_ahead, _ = self._get_path_geometry(theta_term_ahead)
             t_term = t_term_ahead if np.dot(t_term_local, t_term_ahead) > 0.0 else t_term_local
+            self._terminal_t_local = t_term_local
 
 
             self._terminal_ref = np.zeros(self.nx + self.nu)
@@ -1283,6 +1773,8 @@ class DiveControllerMPC(DiveControllerInterface):
             norm = np.linalg.norm(diff) + 1e-8
             t_hat = diff / norm
             self.path_t_hat[:] = t_hat
+            self.path_t_local[:] = t_hat       # straight-line: local == lookahead
+            self._terminal_t_local = t_hat
             self.path_theta_hat[:] = 0.0
             self.theta_total = norm
 

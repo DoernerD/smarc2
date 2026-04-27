@@ -1,6 +1,28 @@
 # my_pkg/entrypoints.py
 from __future__ import annotations
 
+# ---- BLAS / threading determinism (opt-in) --------------------------------
+# Set BEFORE any import that triggers numpy / scipy / acados.  Once those
+# C libraries load, the thread count is fixed and later os.environ changes
+# have no effect.  Enable by exporting SAM_DETERMINISTIC_BLAS=1 in the
+# shell (or via a ros2 launch environment entry) before starting the node.
+# When enabled, every BLAS backend we have a lever on is pinned to a
+# single thread — the MPCC is small enough that single-threaded BLAS is
+# essentially free, and it removes run-to-run solver-iterate jitter that
+# otherwise makes hard trajectories (e.g. the tight k-turn) flip basins.
+import os as _os
+if _os.environ.get("SAM_DETERMINISTIC_BLAS", "0") == "1":
+    for _var in (
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        _os.environ.setdefault(_var, "1")
+del _os
+
 from .dive_runner import Components, Rates, run_mode
 
 from .ParamUtils import DivingModelParam

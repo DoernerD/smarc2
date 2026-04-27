@@ -26,6 +26,24 @@
     <arg name="horizon_current_wp_ratio" default="0.0"/>
     <arg name="build_ocp" default="False"/>
 
+    <!-- Per-axis path interpolator ("cubic" or "pchip").  PCHIP is monotone-
+         preserving and removes the not-a-knot cubic oscillation through
+         sequences of near-collinear waypoints.  Set y to "pchip" for the
+         gentle_dive_test / k-turn trajectories. -->
+    <arg name="mpcc_x_interpolator" default="cubic"/>
+    <arg name="mpcc_y_interpolator" default="cubic"/>
+    <arg name="mpcc_z_interpolator" default="cubic"/>
+
+    <!-- Debug trace: set a non-empty path to write one CSV row per control
+         tick (state, references, MPCC errors, solver status, commands).
+         Post-process with pandas/matplotlib instead of tailing rosout. -->
+    <arg name="debug_trace_csv_path" default=""/>
+    <arg name="debug_print_ref_state_throttle" default="10"/>
+
+    <!-- Abort the action server early if the mission hasn't completed in
+         this many seconds.  Default 370 s (the previous hard-coded value). -->
+    <arg name="mission_timeout_sec" default="370.0"/>
+
     <group>
     <push-ros-namespace namespace="$(var robot_name)"/>
        <node name="diving_node" pkg="sam_diving_controller" exec="mpc_trajectory_tracking" output="screen">
@@ -35,6 +53,8 @@
         <param from="$(var control_yaml)"/>
         <param name="use_sim_time" value="$(var use_sim_time)"/>
         <param name="debug_print_ref_state" value="$(var debug_print_ref_state)"/>
+        <param name="debug_print_ref_state_throttle" value="$(var debug_print_ref_state_throttle)"/>
+        <param name="debug_trace_csv_path" value="$(var debug_trace_csv_path)"/>
         <param name="flip_rudder_command" value="$(var flip_rudder_command)"/>
         <param name="flip_stern_command" value="$(var flip_stern_command)"/>
         <param name="traj_d_tolerance_m" value="$(var traj_d_tolerance_m)"/>
@@ -42,6 +62,10 @@
         <param name="horizon_max_waypoints" value="$(var horizon_max_waypoints)"/>
         <param name="horizon_current_wp_ratio" value="$(var horizon_current_wp_ratio)"/>
         <param name="build_ocp" value="$(var build_ocp)"/>
+        <param name="mpcc_x_interpolator" value="$(var mpcc_x_interpolator)"/>
+        <param name="mpcc_y_interpolator" value="$(var mpcc_y_interpolator)"/>
+        <param name="mpcc_z_interpolator" value="$(var mpcc_z_interpolator)"/>
+        <param name="mission_timeout_sec" value="$(var mission_timeout_sec)"/>
        </node>
     </group>
 

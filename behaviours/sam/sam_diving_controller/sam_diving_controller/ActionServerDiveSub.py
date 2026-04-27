@@ -648,7 +648,17 @@ class MPCPathServer(PathServer, DiveSub):
 
         #node.destroy_subscription(self.path_sub)
 
-        self._loginfo("Path Action Server started")
+        # Per-mission hard timeout.  Making this a ROS param lets the
+        # tester bail early during basin-of-attraction experiments (the
+        # 370 s default is long enough for successful runs but wastes a
+        # lot of wall-clock time on failing ones).
+        node.declare_parameter("mission_timeout_sec", 370.0)
+        self._mission_timeout_sec = float(node.get_parameter(
+            "mission_timeout_sec"
+        ).get_parameter_value().double_value)
+        self._loginfo(
+            f"Path Action Server started (mission_timeout_sec={self._mission_timeout_sec:.1f})"
+        )
 
 
     def _save_path(self, goal_path):
@@ -740,8 +750,10 @@ class MPCPathServer(PathServer, DiveSub):
 
             #self.logger.info(f"elapsed: {elapsed}")
 
-            if elapsed > 370:
-                self.logger.info("Goal was cancelled by timeout.")
+            if elapsed > self._mission_timeout_sec:
+                self.logger.info(
+                    f"Goal was cancelled by timeout ({self._mission_timeout_sec:.1f}s)."
+                )
                 goal_handle.abort()
                 return "cancelled"
 

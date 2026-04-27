@@ -111,10 +111,19 @@ class PathClient(SMARCActionClient):
             ## Dive tests run on SAM in increasing difficulty
             #HERE / "trajectories" / "gentle_straight_dive.csv" # straight dive during the experiments
             #HERE / "trajectories" / "gentle_turn_dive.csv"  # turn towards the corner
+            #HERE / "trajectories" / "gentle_dive_test_2.csv"  # shaping the return a bit better
             #HERE / "trajectories" / "sharper_turn_dive.csv"  # sharper turn dive (full 90 degree turn)
             #HERE / "trajectories" / "sharper_left_turn_dive.csv"  # sharper turn dive (full 90 degree turn)
             #HERE / "trajectories" / "sharper_turn_dive_2.csv"  # sharper turn dive (full 90 degree turn)
-            HERE / "trajectories" / "gentle_dive_test.csv"  # full turn dive
+            #HERE / "trajectories" / "gentle_dive_test.csv"  # full turn dive
+            #HERE / "trajectories" / "gentle_dive_test_wide.csv"  # full turn dive with wide return leg
+            #HERE / "trajectories" / "gentle_dive_test_wide_2_pchip_y.csv"  # full turn dive with wide return leg
+            #HERE / "trajectories" / "gentle_dive_test_wide_2_pchip_y_return_y0.csv"  # full turn dive with wide return leg
+            #HERE / "trajectories" / "gentle_dive_test_wide_2_pchip_y_straight_exit_y15.csv"  # full turn dive with wide return leg
+            #HERE / "trajectories" / "gentle_dive_test_wide_2_pchip_y_wider_exit.csv"  # full turn dive with wide return leg
+            #HERE / "trajectories" / "gentle_dive_test_wide_2_pchip_y_short_tail_padded.csv"  # full turn dive with wide return leg
+            #HERE / "trajectories" / "gentle_dive_test_wide_2_pchip_y_very_short_tail.csv"  # full turn dive with wide return leg
+            HERE / "trajectories" / "gentle_dive_test_wide_2_pchip_y_360_turn.csv"  # full turn dive with wide return leg
             #HERE / "trajectories" / "steep_straight_dive.csv"  # steep straight dive
             #HERE / "trajectories" / "gentle_straight_dive_with_return.csv"  # gentle straight dive with return
 
