@@ -133,3 +133,15 @@ class DiveControllerInterface:
 
     def get_dive_mode(self):
         return self._dive_mode
+
+    def get_ref_input(self):
+        return None
+
+    def get_mpc_pred(self):
+        return None
+
+    def get_mpc_path_ref(self):
+        return None
+    
+    def get_spline_traj(self):
+        return None

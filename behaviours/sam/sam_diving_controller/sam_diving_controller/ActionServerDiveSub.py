@@ -789,3 +789,182 @@ class MPCPathServer(PathServer, DiveSub):
 
         return CancelResponse.ACCEPT
 
+
+class PIDPathServer(PathServer, DiveSub):
+    """Action point server that handle GotoGeopoint messages.
+
+    Attributes:
+        logger: shorthand for `node.get_logger()`
+        robot_name: provided robot name from launch file
+        target_frame: frame that goal's should be transformed to
+    """
+
+    def __init__(self, node: Node, action_name, action_type: ActionType, param):
+
+        self.param = param
+        self._node = node
+
+        PathServer.__init__(self,
+            node,
+            action_name,
+            action_type
+        )
+        DiveSub.__init__(self,self._node, self.param)
+
+        #node.destroy_subscription(self.path_sub)
+
+        # Per-mission hard timeout.  Making this a ROS param lets the
+        # tester bail early during basin-of-attraction experiments (the
+        # 370 s default is long enough for successful runs but wastes a
+        # lot of wall-clock time on failing ones).
+        node.declare_parameter("mission_timeout_sec", 370.0)
+        self._mission_timeout_sec = float(node.get_parameter(
+            "mission_timeout_sec"
+        ).get_parameter_value().double_value)
+        self._loginfo(
+            f"Path Action Server started (mission_timeout_sec={self._mission_timeout_sec:.1f})"
+        )
+
+
+    def _save_path(self, goal_path):
+        """Convert path from TrajectoryMPC message to a (N, 19) numpy array.
+
+        Columns 0-2: position (tracked by MPC stage + terminal cost).
+        Columns 3-6: quaternion (tracked by MPC stage + terminal cost).
+        Column 7: surge velocity (tracked by MPC stage cost).
+        Columns 7-12: full velocity (tracked by MPC terminal cost).
+        Columns 13-18: actuator states — neutral defaults, not tracked by cost.
+        """
+
+        # Set global waypoint to trigger update_tf in DiveSub. Ugly, but works for now.
+        #self._waypoint_global = Odometry()
+        #self._waypoint_global.header.frame_id = self.world_prefix + 'mocap'
+        #self.logger.info(f"Frame id: {self._waypoint_global.header.frame_id}")
+
+        # waypoint global is pose stamped, path is an array of pose stamped
+        self._waypoint_global = goal_path.trajectory[0].wp
+        self._waypoint_global.header.frame_id = self.world_prefix + 'mocap'
+        
+        # NOTE: This is hardcoded right now, ideally, we would get this from somewhere?
+        self._requested_rpm = 450
+        self._goal_tolerance = 0.5 # meters
+        self._received_waypoint = True
+
+        self.path_msg = goal_path
+        self.path_len = len(goal_path.trajectory)
+        self.logger.info(f"AS: saved path")
+        
+    def goal_callback(self, goal_request: ActionType.Goal) -> GoalResponse:
+        """Considers a goal validity and evaluates whether it should be accepted or not.
+
+        Args:
+            goal_request (ActionType.Goal): Goal message
+
+        Returns:
+            response: Either GoalResponse.Accept or GoalResponse.Reject
+
+        """
+        # TODO: Think of whether you want to reject any goal. For now, accept
+        # everything, as we assume the planner to know what it's doing.
+        goal_request = goal_request.goal
+        path = self._json_ops.decode(goal_request, ActC.GOAL)
+        self.logger.info(f"Recieved path")
+        self._save_path(path)
+        #self.path_len = len(self.path)
+
+        # Accepts as all criteria fulfilled
+        return GoalResponse.ACCEPT
+
+
+    def execution_callback(self, goal_handle: ServerGoalHandle) -> ActionResult:
+        """Primary execution callback where goal's are handled after acceptance.
+
+        Args:
+            goal_handle: handle to control server and add callbacks
+
+        Returns:
+            A populated ActionResult message
+        """
+        result_msg = self.action_type.Result
+        status = self.feedback_loop(goal_handle)
+        if status == "cancelled":
+            self.logger.info("Goal was cancelled by client.")
+            self.set_mission_state(MissionStates.CANCELLED, "AS")
+            result_msg.success = False
+            return result_msg
+        
+        self.set_mission_state(MissionStates.COMPLETED, "AS")
+        result_msg.success = True
+        return result_msg
+
+    def feedback_loop(self, goal_handle: ServerGoalHandle):
+        """Abstracted feedback loop where tolerance checks are conducted.
+
+        Args:
+            pose_stamped: target location
+            goal_handle: passed in to enable feedback publishing
+        """
+        rate = self._node.create_rate(2)
+        feedback = self.action_type.Feedback
+        start_time = self._node.get_clock().now()
+
+        # Exit condition: controller signals COMPLETED by setting current_idx to
+        # path_len (one past the last index).  Using < path_len (not < path_len-1)
+        # so that a single-waypoint path (path_len == 1) doesn't exit immediately —
+        # the loop starts with current_idx == 0 == path_len-1, which would be False
+        # with the old condition before the vehicle had even moved.
+        while self.current_idx < self.path_len:
+            current_time = self._node.get_clock().now()
+            elapsed = (current_time - start_time).nanoseconds / 1e9  # seconds
+            self.set_mission_state(MissionStates.RUNNING, "AS")
+
+            #self.logger.info(f"elapsed: {elapsed}")
+            d = self.get_distance()
+            if d is not None and d <= self._goal_tolerance:
+                self.current_idx += 1
+                if self.current_idx < self.path_len:
+                    self._waypoint_global = self.path_msg.trajectory[self.current_idx].wp
+                    self._waypoint_global.header.frame_id = self.world_prefix + 'mocap'
+
+                else:
+                    break
+
+            if elapsed > self._mission_timeout_sec:
+                self.logger.info(
+                    f"Goal was cancelled by timeout ({self._mission_timeout_sec:.1f}s)."
+                )
+                goal_handle.abort()
+                return "cancelled"
+
+            self.set_mission_state(MissionStates.RUNNING, "AS")
+            if goal_handle.is_cancel_requested:
+                self.logger.info("Goal was cancelled by client.")
+                goal_handle.canceled()
+                return "cancelled"
+            
+            feedback.feedback = self._json_ops.encode(float(self.current_idx)) #- NOTE: the encode returns nonetype value if not float
+            goal_handle.publish_feedback(feedback)
+            rate.sleep()
+
+        self.set_mission_state(MissionStates.COMPLETED, "AS")
+        goal_handle.succeed()
+        rate.destroy()
+        return "done"
+
+
+    def cancel_callback(self, goal_handle: ServerGoalHandle) -> CancelResponse:
+        """Handles canceling of goal requests.
+
+        Args:
+            goal_handle: handle
+
+        Returns:
+            Cancel response as ACCEPT
+        """
+
+        self._loginfo("Cancelled")
+
+        self.set_mission_state(MissionStates.CANCELLED, "AS")
+
+        return CancelResponse.ACCEPT
+

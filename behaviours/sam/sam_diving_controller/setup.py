@@ -42,6 +42,7 @@ setup(
             "pid_wp_following = sam_diving_controller.entrypoints:pid_wp_following",
             "mpc_wp_following = sam_diving_controller.entrypoints:mpc_wp_following",
             "mpc_trajectory_tracking = sam_diving_controller.entrypoints:mpc_trajectory_tracking",
+            "pid_trajectory_tracking = sam_diving_controller.entrypoints:pid_trajectory_tracking",
         ],
     },
 )

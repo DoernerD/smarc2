@@ -138,6 +138,8 @@ class ConveniencePub(IDivePub):
 
     def _publish_predicted_path(self):
         x_pred = self._dive_controller.get_mpc_pred()
+        if x_pred is None:
+            return
         predicted_path_msg = self._create_path_msg(x_pred, self._mocap_frame)
 
         self._mpc_pred_pub.publish(predicted_path_msg)
@@ -145,6 +147,8 @@ class ConveniencePub(IDivePub):
 
     def _publish_mpc_path_ref(self):
         path_ref = self._dive_controller.get_mpc_path_ref()
+        if path_ref is None:
+            return
         mpc_path_msg = self._create_path_msg(path_ref, self._mocap_frame)
 
         self._mpc_path_pub.publish(mpc_path_msg)

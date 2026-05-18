@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 from sam_diving_controller.controllers.PIDControl import PIDControl
+from nav_msgs.msg import Odometry
 from sam_diving_controller.IDivePub import MissionStates, ActuatorStates
 from sam_diving_controller.controllers.DiveControllerInterface import DiveControllerInterface
 from smarc_control_msgs.msg import ControlError, ControlInput, ControlReference
@@ -56,7 +57,7 @@ class DiveControllerPID(DiveControllerInterface):
         """
         mission_state = self._dive_sub.get_mission_state()
 
-        # self._loginfo_once(f"DC: {mission_state}")
+        self._loginfo_once(f"DC: {mission_state}")
 
         if mission_state == MissionStates.RECEIVED:
             self._loginfo_once("Mission Received")
@@ -82,39 +83,28 @@ class DiveControllerPID(DiveControllerInterface):
         dive_pitch_setpoint = self._dive_sub.get_dive_pitch()
         heading_setpoint = self._dive_sub.get_heading_setpoint()
         rpm_setpoint = self._dive_sub.get_rpm_setpoint()
-        waypoint_odom = self._dive_sub.get_odom_waypoint()
+        waypoint_odom = self._dive_sub.get_waypoint_in_odom()
         waypoint_global = self._dive_sub.get_waypoint()
 
         # Get current states
-        self._current_state = self._dive_sub.get_states()
+        self._current_state = self._dive_sub.get_states_in_mocap()
         current_depth = self._dive_sub.get_depth()
         current_pitch = self._dive_sub.get_pitch()
         current_heading = self._dive_sub.get_heading()
         current_distance = self._dive_sub.get_distance()
+        current_idx = self._dive_sub.get_current_idx()
 
         if not self._dive_sub.has_waypoint():
+            self._loginfo("No waypoint yet")
             return
 
         if depth_setpoint is None:
             self._loginfo("No depth setpoint yet")
             return
 
-        # Debug prints
-        s = ''
-        s += f'state: x: {self._current_state.pose.pose.position.x:.3f}'
-        s += f' y: {self._current_state.pose.pose.position.y:.3f}'
-        s += f' z: {self._current_state.pose.pose.position.z:.3f}\n'
-        s += f'wp odom: x: {waypoint_odom.position.x:.3f}'
-        s += f' y: {waypoint_odom.position.y:.3f}'
-        s += f' z: {waypoint_odom.position.z:.3f}'
-        s += f'wp global: x: {waypoint_global.pose.position.x:.3f}'
-        s += f' y: {waypoint_global.pose.position.y:.3f}'
-        s += f' z: {waypoint_global.pose.position.z:.3f}'
-
-        self._loginfo(s)
 
         # Sketchy minus signs...
-        depth_setpoint *= -1
+        #depth_setpoint *= -1 # The csv file provides the depth already positively
         current_depth *= -1
 
         depth_error = depth_setpoint - current_depth
@@ -126,10 +116,10 @@ class DiveControllerPID(DiveControllerInterface):
         # doing look ahead diving with fixed look ahead distance
         if np.abs(depth_error) <= 0.5:
             self._dive_mode = "Active Diving"
-            pitch_setpoint = dive_pitch_setpoint
+            pitch_setpoint = -dive_pitch_setpoint
 
             u_rpm = rpm_setpoint
-            u_vbs_raw = self.param['vbs_u_neutral']
+            u_vbs_raw = 50.0 #self.param['vbs_u_neutral']
             u_lcg_raw = self.param['lcg_u_neutral']
             u_vbs = u_vbs_raw
             u_lcg = u_lcg_raw
@@ -159,14 +149,39 @@ class DiveControllerPID(DiveControllerInterface):
         self._dive_pub.set_lcg(u_lcg)
         self._dive_pub.set_thrust_vector(u_tv_rudder, u_tv_stern)
         self._dive_pub.set_rpm(u_rpm, u_rpm)
+        
+        
+        # Debug prints
+        s = '\n----------------------------------------\n'
+        s += f'DC: {mission_state}, idx: {current_idx}\n'
+        s += f'dive mode: {self._dive_mode}\n'
+        s += f'state in {self._current_state.header.frame_id}: x: {self._current_state.pose.pose.position.x:.3f}'
+        s += f' y: {self._current_state.pose.pose.position.y:.3f}'
+        s += f' z: {self._current_state.pose.pose.position.z:.3f}\n'
+        s += f'wp odom: x: {waypoint_odom.position.x:.3f}'
+        s += f' y: {waypoint_odom.position.y:.3f}'
+        s += f' z: {waypoint_odom.position.z:.3f}\n'
+        s += f'wp global: x: {waypoint_global.pose.position.x:.3f}'
+        s += f' y: {waypoint_global.pose.position.y:.3f}'
+        s += f' z: {waypoint_global.pose.position.z:.3f}\n'
+        s += f'distance: {current_distance:.3f} '
+        s += f'depth: {current_depth:.3f} '
+        s += f'pitch: {current_pitch:.3f} '
+        s += f'heading: {current_heading:.3f}\n'
+        s += f'depth error: {depth_error:.3f} '
+        s += f'pitch error: {pitch_error:.3f} '
+        s += f'yaw error: {yaw_error:.3f}\n'
+        s += f'vbs: {u_vbs:.3f} '
+        s += f'lcg: {u_lcg:.3f}\n'
+        s += f'tv stern: {u_tv_stern:.3f} '
+        s += f'tv rudder: {u_tv_rudder:.3f}\n'
+        s += f'rpm1: {u_rpm:.3f} '
+        s += f'rpm2: {u_rpm:.3f}\n'
+        s += '----------------------------------------\n'
+
+        self._loginfo(s)
 
         # Convenience Topics
-        self._ref = ControlReference()
-        self._ref.z = depth_setpoint
-        self._ref.pitch = pitch_setpoint
-        self._ref.x = waypoint_odom.position.x
-        self._ref.y = waypoint_odom.position.y
-
         self._error = ControlError()
         self._error.z = depth_error
         self._error.pitch = pitch_error
@@ -179,6 +194,16 @@ class DiveControllerPID(DiveControllerInterface):
         self._input.lcg = u_lcg
         self._input.thrustervertical = u_tv_stern
         self._input.thrusterhorizontal = u_tv_rudder
-        self._input.thrusterrpm = float(u_rpm)
+        self._input.thrusterrpm1 = float(u_rpm)
+        self._input.thrusterrpm2 = float(u_rpm)
+        
 
-        return
+        self._ref = Odometry()
+        self._ref.pose.pose.position.x = waypoint_odom.position.x
+        self._ref.pose.pose.position.y = waypoint_odom.position.y
+        self._ref.pose.pose.position.z = waypoint_odom.position.z
+        self._ref.pose.pose.orientation.w = waypoint_global.pose.orientation.w
+        self._ref.pose.pose.orientation.x = waypoint_global.pose.orientation.x
+        self._ref.pose.pose.orientation.y = waypoint_global.pose.orientation.y
+        self._ref.pose.pose.orientation.z = waypoint_global.pose.orientation.z
+

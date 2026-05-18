@@ -86,9 +86,10 @@ class DiveSub():
         self._pitch = None
 
         # Trajectory tracking variables.
-        self.path = None
+        self.path = None # numpy array for the MPCPathServer
         self.path_len = None
         self.current_idx = 0
+        self.path_msg = None # PathMessage for the PIDPathServer to save
 
         self._mission_state = MissionStates.NONE
 
@@ -116,6 +117,9 @@ class DiveSub():
         self.depth_sub = node.create_subscription(msg_type=PoseWithCovarianceStamped, topic=DRTopics.DR_DEPTH_POSE_TOPIC, callback=self._depth_cb, qos_profile=10)
         self.pitch_sub = node.create_subscription(msg_type=Imu, topic=ControlTopics.PITCH, callback=self._pitch_cb, qos_profile=10)
 
+        # FIXME: This is never used, check if we use self.path anywhere
+        # self.path is used by the MPCPathServer as a numpy array to send to the MPC. 
+        # otherwise it's not used, so we could use it with the PIDPathServer as ros path?
         # Path subscriber - Added for trajectory tracking
         #self.path_sub = node.create_subscription(msg_type=TrajectoryMPC, topic='planned_path', callback=self._path_cb, qos_profile=10)
 
@@ -253,6 +257,7 @@ class DiveSub():
             return
 
         if self._tf_base_link_global is None:
+            self._loginfo("No tf base link global yet")
             return
 
         self._waypoint_in_odom = tf2_geometry_msgs.do_transform_pose(self._waypoint_global.pose, self._tf_odom_global)
@@ -475,13 +480,16 @@ class DiveSub():
         """
         
         self.current_idx = idx
+        
+    def get_current_idx(self):
+        return self.current_idx
 
     def update(self):
         """
         All the things when updating
         """
         self._update_tf()
-        #self._transform_wp()
+        self._transform_wp()
         self._transform_state()
 
 
